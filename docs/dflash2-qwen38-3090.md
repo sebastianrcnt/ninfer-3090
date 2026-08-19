@@ -3,6 +3,10 @@
 Status: complete for the RTX 3090 single-user target. The final lossless DFlash 2 path reaches
 103.5 tok/s on GSM8K and 94.2 tok/s on HumanEval using kernel changes only.
 
+TurboQuant extension status: implemented and serving at 262K capacity; 32K quality passes, but
+the strict 98K/262K serving-quality matrix and the no-throughput-regression contract are not yet
+closed.  Do not read the completed DFlash 2 status above as completion of this later extension.
+
 Hardware: one RTX 3090 (GA102, `sm_86`, 24 GiB, 936 GB/s), driver 590.48.01, CUDA 13.1.
 Target artifact: `qwen3_8_27b.ninfer`, 18,210,531,328 B on disk, 16.67 GiB resident.
 Engine: `/build/apps/ninfer-serve` in `ninfer-3090:dev`, INT8 KV, CUDA Graphs on,
@@ -351,6 +355,110 @@ Consequently a perfect rewrite of every remaining kernel is expected to top out 
 not 130 tok/s. Reaching 130 requires changing the numerical target, model representation, or
 hardware assumption; it is not a credible kernel-only milestone. The requested 100/80 tok/s
 contract is achieved without any such change.
+
+## TurboQuant / PolarQuant 262K KV extension
+
+The production server now uses `--kv-dtype turboquant --max-context 262144
+--kv-capacity 262144`.  This is a runtime-only KV representation: neither the 18.21 GB target
+artifact nor the 2.16 GB DFlash 2 sidecar is converted or modified.  No GPU power, voltage,
+clock, or power-limit setting was changed.
+
+### Packed representation
+
+Each 256-dimensional K or V row first receives the same deterministic signed orthogonal
+Hadamard rotation.  PolarQuant stores the resulting unit direction as the complete 255-node
+binary angle tree at three bits per node and stores one FP16 radius.  Keys additionally store a
+256-bit QJL residual sign projection and one FP16 residual norm.
+
+| Plane | Bytes / head / token | Contents |
+|---|---:|---|
+| V | 98 | 96-byte 3-bit Polar tree + FP16 radius |
+| K | 132 | V-format direction + 32-byte QJL signs + FP16 residual norm |
+| K + V | **230** | **3.59375 physical bits/value** including both row scales |
+
+The quantized payload itself is 3.5 bits/value; the two FP16 row values account for the
+0.09375-bit physical overhead.  Pages remain 64 tokens and are consumed in place.  There is no
+persistent BF16 expansion cache and no extra target-weight read.
+
+### GPU paths
+
+* Append performs the signed Hadamard, Polar tree quantization, and QJL residual projection
+  directly into the paged byte planes.
+* T=1..8 uses one fused CTA per KV head/split.  It decodes each packed K/V tile once for every
+  query position, performs the Polar and QJL products with `sm_86` BF16 Tensor Core MMA, keeps
+  online-softmax/value accumulation in FP32 registers, and is independently CUDA-Graph
+  capturable for every fixed width.  It uses the same exact 16-coordinate tree decoder and a
+  one-time QJL dual query transform; the latter is supplied through opt-in dynamic shared memory
+  so T=6..8 does not exceed GA102's static-shared-memory ceiling.
+* Prompt attention is FlashAttention-style with 64 query rows and 32 packed key rows per CTA.
+  The QJL dual transform is applied once per query row, so the packed sign plane feeds a second
+  MMA without reconstructing each cached key.  A 16-coordinate exact tree decoder shares the
+  Polar prefix while preserving each coordinate's multiplication order; this reduced the
+  profiled 128-token prompt kernel from 7.351 ms to **1.467 ms** (5.01x).
+* INT8/BF16 dispatch and their kernels are unchanged and remain available as fallback modes.
+
+The DFlash 2 artifact has five local-attention layers and no full-attention drafter layer.  The
+old runtime nevertheless reserved a context-sized BF16 full-KV pool for their common ABI.  The
+planner now retains one dummy page for all-local DFlash while preserving the original pool for
+DFlash variants that actually have full-attention layers.  This is what closes the 262K memory
+budget without weakening the target cache.
+
+### Production memory
+
+Final service parameters include `--prefill-chunk 2048`, CUDA Graphs, DFlash 2 with seven draft
+tokens, and one request in flight.  Startup reports:
+
+| Item | Final value |
+|---|---:|
+| resolved KV capacity | 262,144 tokens / 4,096 pages |
+| runtime reservation | 4.46 GiB |
+| free after target weights | 4.87 GiB |
+| free after startup | **435.94 MiB** |
+| allocator slack | 417.53 MiB |
+| CUDA Graph use / allowance | 12.00 / 32.00 MiB |
+
+This exceeds the required 300 MiB device headroom while the desktop and Sunshine remain in their
+normal state.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| packed A1 vs FP64 causal attention | relative L2 0.231508 |
+| 128-token, two-page prompt vs FP64 causal attention | relative L2 0.234337 |
+| append determinism and A1/A3 packed-cache parity | bit-identical |
+| CUDA Graph replay, every T=1..8 | bit-identical to eager |
+| logical page 4,095 / position 262,143 append + decode | finite output, pass |
+| ordinary BF16/INT8 GQA public contract | pass |
+| Qwen runtime mechanism checks | pass |
+| real target + real DFlash 2 greedy losslessness | **PASS**, three prompt families |
+
+The final complete 88-entry suite took 116.11 seconds and retains exactly the eight documented
+`sm_86`/NVFP4 and 1e-5 baseline failures; TurboQuant adds no regression.  Eight optional/real
+artifact tests skip without their environment variables; the real DFlash 2 test was also run
+separately with both artifacts and passed.
+
+### Serving-path context validation
+
+The 31,485-token test places independent Korean, English, Python-expression, and arithmetic
+needles across the prompt.  Greedy generation with thinking disabled recovered all four values
+exactly: `해오라기-7319`, `cobalt-orbit-4821`, `x*x+1`, and `1591`.
+
+| Context | Result | prefill | decode | wall |
+|---:|---|---:|---:|---:|
+| 31,485 | all four exact | 62.7 tok/s | 3.5 tok/s | 513.3 s |
+
+The tree/QJL small-T rewrite improved the same 32K decode from 0.7 to 3.5 tok/s (5.0x).  Short
+production prompts measured 49.0 / 114.2 / 92.8 / 65.4 tok/s (Korean math / English / code /
+Korean factual; 80.4 tok/s mean), with every answer correct.  The 98K serving-path extension and
+262K endpoint/stability coverage follow the same exact prefix; any throughput comparison must use
+the same context length because full-attention cost grows with the visible KV length.
+
+A 97,885-token request was sampled far enough to confirm normal prefill and then cancelled cleanly:
+the stateless Chat Completions path did not retain the preceding 32K KV, and the measured quadratic
+growth projected roughly 80 minutes for that single request.  It is not counted as a 98K quality
+pass.  Position 262,143 is covered by the direct packed append/decode test, but that is likewise
+not a substitute for the still-open 262K Needle/RULER serving run.
 
 ### Optional follow-up work
 

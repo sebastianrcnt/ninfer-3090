@@ -47,6 +47,9 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
         .kv_heads                  = 2,
         .attention_head_dim        = 64,
         .kv_dtype                  = dtype,
+        .kv_storage                = dtype == ninfer::DType::I8
+                                         ? ninfer::KvCacheStorage::Int8Group64
+                                         : ninfer::KvCacheStorage::BFloat16,
         .kv_quant_group            = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
@@ -104,6 +107,25 @@ void test_decoder_layout() {
            "INT8 MTP KV has scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
+
+    ninfer::LayoutBuilder tq_builder;
+    q36::DecoderStateSpec tq_spec = decoder_spec(ninfer::DType::BF16, false);
+    tq_spec.full_attention_layers = 16;
+    tq_spec.capacity = 262144;
+    tq_spec.kv_heads = 4;
+    tq_spec.attention_head_dim = q36::kTurboQuantHeadDim;
+    tq_spec.kv_dtype = ninfer::DType::U8;
+    tq_spec.kv_storage = ninfer::KvCacheStorage::TurboQuant;
+    tq_spec.text_physical_page_groups = 4096;
+    const q36::DecoderStateLayout tq = q36::plan_decoder_state(tq_builder, tq_spec);
+    (void)tq_builder.finish(256);
+    expect(tq.text_kv.pool.planes.size() == 32 &&
+               tq.text_kv.pool.planes[0].spec.leading_extent == q36::kTurboQuantKeyBytes &&
+               tq.text_kv.pool.planes[1].spec.leading_extent == q36::kTurboQuantValueBytes,
+           "TurboQuant uses packed key/value planes only");
+    expect(tq.kv_payload_bytes() ==
+               ninfer::ops::turboquant::payload_bytes(262144, 4, 16),
+           "TurboQuant 262K payload accounting is exact");
 }
 
 void test_round_layout() {

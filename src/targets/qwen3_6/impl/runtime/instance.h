@@ -38,6 +38,9 @@ inline constexpr float kGdnScale                         = Variant::gdn_scale;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = Variant::prefill_chunk_alignment;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = Variant::maximum_mtp_draft_tokens;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = Variant::maximum_dflash_draft_tokens;
+// DFlash 2 has only sliding-window layers. Keep a single dummy full-KV page for the shared
+// graph/control ABI, but never reserve or materialize a context-sized backing pool for it.
+inline constexpr bool kDFlashUsesFullKV = DFlashConfig::local_layers < DFlashConfig::layers;
 
 inline std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {
     return Variant::ordinary_graph_profiles(capacity);

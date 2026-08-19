@@ -108,7 +108,10 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+        // All-local DFlash keeps one dummy full-KV page so the common allocation/table-row ABI
+        // remains stable. No DFlash layer reads or writes this pool.
+        base->backend_kv_page_entitlement =
+            kDFlashUsesFullKV ? pages_for_tokens(reserved_context_tokens) : 1U;
     }
     base->summary.admission = runtime::AdmissionResources{
         .active_lanes     = 1,

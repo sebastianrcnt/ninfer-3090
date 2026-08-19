@@ -50,6 +50,7 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
     if (value == "rk8v4") { return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; }
+    if (value == "turboquant") { return KvCacheStorage::TurboQuant; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -70,7 +71,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|rk8v4] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8|rk8v4|turboquant] [--spec mtp|dflash --draft-tokens N] "
            "[--draft-artifact FILE] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "

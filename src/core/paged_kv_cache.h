@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "ninfer/types.h"
 
 #include <cuda_runtime_api.h>
 
@@ -29,6 +30,7 @@ struct PagedKVLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
+    KvCacheStorage storage    = KvCacheStorage::BFloat16;
     std::int32_t quant_group  = 0;
     bool packed_v             = false;
     bool rotate_k             = false;
@@ -51,6 +53,7 @@ struct PagedKVBatchLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
+    KvCacheStorage storage    = KvCacheStorage::BFloat16;
     std::int32_t quant_group  = 0;
     bool packed_v             = false;
     bool rotate_k             = false;

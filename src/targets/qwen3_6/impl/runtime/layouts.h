@@ -66,6 +66,7 @@ struct SequencePlanningInputs {
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     std::int32_t kv_quant_group            = 0;
     bool kv_packed_v                       = false;
     bool kv_rotate_k                       = false;
@@ -91,6 +92,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     std::int32_t kv_quant_group            = 0;
     bool kv_packed_v                       = false;
     bool kv_rotate_k                       = false;

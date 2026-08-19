@@ -3,6 +3,7 @@
 
 #include "core/layout.h"
 #include "ops/launcher/gqa_attention.h"
+#include "ninfer/ops/turboquant.h"
 
 #include <algorithm>
 #include <cmath>
@@ -52,7 +53,9 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    const bool is_turboquant = cache.storage == KvCacheStorage::TurboQuant;
+    if ((!is_turboquant && cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+        (is_turboquant && cache.dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -74,6 +77,27 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
+    if (is_turboquant) {
+        if (cache.quant_group != 0 || cache.packed_v || cache.rotate_k || cache.rotate_v ||
+            cache.k_pages.dtype != DType::U8 || cache.v_pages.dtype != DType::U8) {
+            throw std::invalid_argument(std::string(op) + ": invalid TurboQuant cache flags");
+        }
+        require_shape(cache.k_pages, turboquant::kKeyBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache k pages");
+        require_shape(cache.v_pages, turboquant::kValueBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache v pages");
+        require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
+        require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
+        if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
+            throw std::invalid_argument(std::string(op) + ": TurboQuant cache has no scale planes");
+        }
+        if (cache.block_table.dtype != DType::I32) {
+            throw std::invalid_argument(std::string(op) + ": block table must be I32");
+        }
+        require_shape(cache.block_table, logical_pages, 1, 1, 1, op, "block table");
+        require_contiguous_nonnull(cache.block_table, op, "block table");
+        return static_cast<std::uint32_t>(capacity);
+    }
     const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
     if (cache.k_pages.dtype != code_dtype ||
         cache.v_pages.dtype != (cache.packed_v ? DType::U8 : code_dtype)) {
@@ -114,7 +138,9 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    const bool is_turboquant = cache.storage == KvCacheStorage::TurboQuant;
+    if ((!is_turboquant && cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+        (is_turboquant && cache.dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -137,6 +163,27 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
+    if (is_turboquant) {
+        if (cache.quant_group != 0 || cache.packed_v || cache.rotate_k || cache.rotate_v ||
+            cache.k_pages.dtype != DType::U8 || cache.v_pages.dtype != DType::U8) {
+            throw std::invalid_argument(std::string(op) + ": invalid TurboQuant cache flags");
+        }
+        require_shape(cache.k_pages, turboquant::kKeyBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache k pages");
+        require_shape(cache.v_pages, turboquant::kValueBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache v pages");
+        require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
+        require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
+        if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
+            throw std::invalid_argument(std::string(op) + ": TurboQuant cache has no scale planes");
+        }
+        if (cache.block_tables.dtype != DType::I32) {
+            throw std::invalid_argument(std::string(op) + ": block tables must be I32");
+        }
+        require_shape(cache.block_tables, logical_pages, table_rows, 1, 1, op, "block tables");
+        require_contiguous_nonnull(cache.block_tables, op, "block tables");
+        return static_cast<std::uint32_t>(capacity);
+    }
     const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
     if (cache.k_pages.dtype != code_dtype ||
         cache.v_pages.dtype != (cache.packed_v ? DType::U8 : code_dtype)) {
@@ -365,7 +412,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
+    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) ||
+        batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
@@ -382,8 +430,10 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         return layout.peak_bytes(1);
     };
     const auto exact_capacity = [&](std::int32_t width) {
-        const detail::GqaAttentionRoute route =
-            detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope);
+        const detail::GqaAttentionRoute route = cache_dtype == DType::U8 && width <= 8
+                                                    ? detail::GqaAttentionRoute::SmallT
+                                                    : detail::gqa_attention_resolve_route(
+                                                          q_heads, width, batch_size, envelope);
         if (route == detail::GqaAttentionRoute::Prompt) { return std::size_t{0}; }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
@@ -424,7 +474,9 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
 
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
-        detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
+        cache.storage == KvCacheStorage::TurboQuant && width <= 8
+            ? detail::GqaAttentionRoute::SmallT
+            : detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream);
@@ -477,12 +529,15 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
     auto scope = workspace.scope();
-    if (detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope) ==
-        detail::GqaAttentionRoute::ChunkedSmallT) {
+    const detail::GqaAttentionRoute route =
+        cache.storage == KvCacheStorage::TurboQuant && q.ne[2] <= 8
+            ? detail::GqaAttentionRoute::SmallT
+            : detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope);
+    if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
         return;
     }
-    if (detail::gqa_attention_uses_small_t(q.ne[2])) {
+    if (route == detail::GqaAttentionRoute::SmallT) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);

@@ -243,6 +243,7 @@ public:
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
+    const KvCacheStorage kv_storage;
     const std::int32_t kv_quant_group;
     const bool kv_packed_v;
     const bool kv_rotate_k;

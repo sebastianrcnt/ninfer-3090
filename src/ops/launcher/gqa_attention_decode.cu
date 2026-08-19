@@ -5,6 +5,7 @@
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
+#include "ops/kernel/gqa_attention_turboquant.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/gqa_attention.h"
 
@@ -202,6 +203,57 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename Geometry, int TokenTile, typename CacheInput>
+void launch_turboquant_partial(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                               PagedKVBatchLayerView cache,
+                               const GqaSmallTInvocation& invocation,
+                               std::int32_t logical_capacity, std::int32_t splits,
+                               Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+                               cudaStream_t stream) {
+    if constexpr (CacheInput::writes_cache) {
+        const dim3 append_grid(TokenTile * Geometry::KVHeads, 1, invocation.batch_size);
+        gqa_turboquant_append_batch_kernel<Geometry><<<append_grid, 256, 0, stream>>>(
+            input.k, input.v, static_cast<const std::int32_t*>(pos.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
+            static_cast<std::uint8_t*>(cache.k_pages.data),
+            static_cast<std::uint8_t*>(cache.v_pages.data), invocation.full_width,
+            invocation.column_begin, TokenTile, invocation.batch_size);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+    constexpr int kRows = TokenTile * Geometry::GroupSize;
+    constexpr int kMmaRows = ((kRows + 15) / 16) * 16;
+    constexpr std::size_t kQjlSharedBytes =
+        static_cast<std::size_t>(kMmaRows) * turboquant::kHeadDim * sizeof(__nv_bfloat16);
+    static const cudaError_t attr = cudaFuncSetAttribute(
+        gqa_turboquant_mma_attention_kernel<Geometry, TokenTile>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kQjlSharedBytes));
+    CUDA_CHECK(attr);
+    gqa_turboquant_mma_attention_kernel<Geometry, TokenTile>
+        <<<grid, 256, kQjlSharedBytes, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), static_cast<const std::int32_t*>(pos.data),
+            static_cast<const std::uint8_t*>(cache.k_pages.data),
+            static_cast<const std::uint8_t*>(cache.v_pages.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+            invocation.batch_size, logical_capacity, scale,
+            static_cast<__nv_bfloat16*>(partial_acc.data),
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
     return {
         .k_pages       = cache.k_pages,
@@ -212,6 +264,7 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .head_dim      = cache.head_dim,
         .num_kv_heads  = cache.num_kv_heads,
         .dtype         = cache.dtype,
+        .storage       = cache.storage,
         .quant_group   = cache.quant_group,
         .packed_v      = cache.packed_v,
         .rotate_k      = cache.rotate_k,
@@ -225,7 +278,9 @@ bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tok
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    const std::int32_t maximum_tokens = cache_dtype == DType::U8 ? 8 : 6;
+    if (tokens < 1 || tokens > maximum_tokens ||
+        (cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -255,7 +310,11 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 #define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
-            if (cache.dtype == DType::I8) {                                                        \
+            if (cache.dtype == DType::U8) {                                                        \
+                launch_turboquant_partial<Geometry, (TOKENS)>(                                     \
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
+                    partial_acc, partial_m, partial_l, stream);                                    \
+            } else if (cache.dtype == DType::I8) {                                                 \
                 if (cache.packed_v) {                                                              \
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, MultiBatch, Masked>(\
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
@@ -286,6 +345,17 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         }                                                                                          \
     } while (0)
 
+#define NINFER_GQA_TQ_ONLY_DISPATCH(TOKENS)                                                        \
+    do {                                                                                           \
+        if (cache.dtype != DType::U8) {                                                            \
+            throw std::invalid_argument("gqa_attention_small_t_launch: T=7/8 requires "          \
+                                        "TurboQuant cache");                                     \
+        }                                                                                          \
+        launch_turboquant_partial<Geometry, (TOKENS)>(                                             \
+            q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,        \
+            partial_m, partial_l, stream);                                                         \
+    } while (0)
+
     switch (invocation.width) {
     case 1:
         NINFER_GQA_SMALL_T_DISPATCH(1, 2);
@@ -305,10 +375,17 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     case 6:
         NINFER_GQA_SMALL_T_DISPATCH(6, 4);
         break;
+    case 7:
+        NINFER_GQA_TQ_ONLY_DISPATCH(7);
+        break;
+    case 8:
+        NINFER_GQA_TQ_ONLY_DISPATCH(8);
+        break;
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
     }
 #undef NINFER_GQA_SMALL_T_DISPATCH
+#undef NINFER_GQA_TQ_ONLY_DISPATCH
 
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = 64;
@@ -349,12 +426,19 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
             launch_profile.template operator()<Int8, true, false>();
         }
     };
-    if (cache.dtype == DType::I8) {
+    if (cache.dtype == DType::I8 || cache.dtype == DType::U8) {
         launch_for_dtype.template operator()<true>();
     } else {
         launch_for_dtype.template operator()<false>();
     }
     CUDA_CHECK(cudaGetLastError());
+    if (cache.dtype == DType::U8) {
+        const int units = invocation.batch_size * invocation.width * Geometry::QHeads;
+        gqa_turboquant_inverse_output_kernel<Geometry><<<units, 256, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(out.data), invocation.width, invocation.full_width,
+            invocation.column_begin, invocation.batch_size);
+        CUDA_CHECK(cudaGetLastError());
+    }
     if (cache.rotate_v) {
         const int units = invocation.batch_size * invocation.width * Geometry::QHeads *
                           kGqaKvQuantGroups;

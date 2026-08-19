@@ -116,6 +116,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_heads                  = TextConfig::kv_heads,
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_dtype                  = plan.kv_dtype,
+                     .kv_storage                = plan.kv_storage,
                      .kv_quant_group            = plan.kv_quant_group,
                      .kv_packed_v               = plan.kv_packed_v,
                      .kv_rotate_k               = plan.kv_rotate_k,
@@ -160,8 +161,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency));
+            const std::uint32_t full_physical_pages = kDFlashUsesFullKV ? physical_pages : 1U;
             PagedKVPoolSpec full_pool{
-                .page_group_count      = physical_pages,
+                .page_group_count      = full_physical_pages,
                 .logical_page_capacity = logical_pages,
                 .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
                 .plane_order           = PagedKVPlaneOrder::HeadMajor,
@@ -664,6 +666,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->device              = inputs.device;
     impl->kv_dtype            = inputs.kv_dtype;
+    impl->kv_storage          = inputs.kv_storage;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->kv_packed_v         = inputs.kv_packed_v;
     impl->kv_rotate_k         = inputs.kv_rotate_k;
@@ -722,7 +725,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                             // them and the residual add. With the profile count held to two
                             // ranges a capture measures 10 MiB; this bound carries headroom
                             // over that and over DFlash 1's own allowance.
-                            return 128ULL * kMiB;
+                            // TurboQuant adds fixed append/inverse-rotation nodes, but its two
+                            // captured profile classes remain well below 32 MiB in aggregate.
+                            // Preserve the established conservative allowance for other caches.
+                            return impl->kv_storage == KvCacheStorage::TurboQuant ? 32ULL * kMiB
+                                                                                  : 128ULL * kMiB;
                         }
                         return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
                     },
@@ -758,8 +765,15 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        .kv_dtype = options.kv_cache == KvCacheStorage::BFloat16
+                        ? DType::BF16
+                        : (options.kv_cache == KvCacheStorage::TurboQuant ? DType::U8 : DType::I8),
+        .kv_storage     = options.kv_cache,
+        .kv_quant_group = options.kv_cache == KvCacheStorage::Int8Group64 ||
+                                  options.kv_cache ==
+                                      KvCacheStorage::RotatedInt8KeyInt4ValueGroup64
+                              ? qwen3_6::kKvQuantGroup
+                              : 0,
         .kv_packed_v = options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
         .kv_rotate_k = options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
         .kv_rotate_v = options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,

@@ -18,6 +18,7 @@
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
+#include "ops/kernel/gqa_attention_turboquant.cuh"
 
 namespace ninfer::ops {
 
@@ -96,20 +97,86 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
     }
 }
 
+template <typename Geometry, int Bc>
+__device__ __forceinline__ void gqa_prefill_stage_tq_key(
+    __nv_bfloat16* polar_dst, __nv_bfloat16* qjl_dst, const std::uint8_t* cache, int kv_head,
+    int k0, int max_query_abs, int physical_page, int tid) {
+    constexpr int D       = kGqaPrefillHeadDim;
+    constexpr int Threads = kGqaPrefillThreads;
+    constexpr float kQjlFactor  = 0.00489575835f;
+
+    constexpr int Groups = D / 16;
+    for (int task = tid; task < Bc * Groups; task += Threads) {
+        const int key_l = task / Groups;
+        const int d_base = (task - key_l * Groups) * 16;
+        const int key   = k0 + key_l;
+        float polar[16]{};
+        const std::uint8_t* row = nullptr;
+        float gamma_factor = 0.0f;
+        if (key <= max_query_abs) {
+            row = cache + paged_kv_element_offset<tq::kKeyBytes, Geometry::KVHeads>(
+                              physical_page, kv_head, (k0 & kPagedKVPageMask) + key_l, 0);
+            tq_decode_block16(row, d_base, polar);
+            const float gamma =
+                __half2float(*reinterpret_cast<const __half*>(row + tq::kQjlNormOffset));
+            gamma_factor = gamma * kQjlFactor;
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int d = d_base + i;
+            const unsigned bit = row == nullptr
+                                     ? 0U
+                                     : (row[tq::kQjlSignsOffset + (d >> 3)] >> (d & 7)) & 1U;
+            polar_dst[key_l * D + gqa_prefill_swz(key_l, d)] = __float2bfloat16(polar[i]);
+            qjl_dst[key_l * D + gqa_prefill_swz(key_l, d)] =
+                __float2bfloat16(row == nullptr ? 0.0f
+                                                : (bit ? gamma_factor : -gamma_factor));
+        }
+    }
+    __syncthreads();
+}
+
+template <typename Geometry, int Bc>
+__device__ __forceinline__ void gqa_prefill_stage_tq_value(
+    __nv_bfloat16* dst, const std::uint8_t* cache, int kv_head, int k0, int max_query_abs,
+    int physical_page, int tid) {
+    constexpr int D       = kGqaPrefillHeadDim;
+    constexpr int Threads = kGqaPrefillThreads;
+    constexpr int Groups = D / 16;
+    for (int task = tid; task < Bc * Groups; task += Threads) {
+        const int key_l = task / Groups;
+        const int d_base = (task - key_l * Groups) * 16;
+        const int key   = k0 + key_l;
+        float values[16]{};
+        if (key <= max_query_abs) {
+            const std::uint8_t* row =
+                cache + paged_kv_element_offset<tq::kValueBytes, Geometry::KVHeads>(
+                            physical_page, kv_head, (k0 & kPagedKVPageMask) + key_l, 0);
+            tq_decode_block16(row, d_base, values);
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int d = d_base + i;
+            dst[key_l * D + gqa_prefill_swz(key_l, d)] = __float2bfloat16(values[i]);
+        }
+    }
+    __syncthreads();
+}
+
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata>
+template <typename Geometry, bool TurboQuant, typename Metadata>
 __launch_bounds__(kGqaPrefillThreads, 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
-                                           const __nv_bfloat16* __restrict__ cache_k,
-                                           const __nv_bfloat16* __restrict__ cache_v,
+                                           const void* __restrict__ cache_k,
+                                           const void* __restrict__ cache_v,
                                            Metadata metadata,
                                            const std::int32_t* __restrict__ positions, float scale,
                                            __nv_bfloat16* __restrict__ out, std::int32_t width) {
     constexpr int D             = kGqaPrefillHeadDim; // 256
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
-    constexpr int Bc            = kGqaPrefillBc;      // 64 key cols
+    constexpr int Bc            = TurboQuant ? 32 : kGqaPrefillBc;
     constexpr int Threads       = kGqaPrefillThreads; // 128
     constexpr int QKNt          = Bc / 8;             // 8  QK score n-tiles
     constexpr int QKKs          = D / 16;             // 16 QK contraction steps over head_dim
@@ -124,6 +191,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     __nv_bfloat16* q_s = gqa_smem;     // [Br, D] swizzled
     __nv_bfloat16* k_s = q_s + Br * D; // [Bc, D] swizzled
     __nv_bfloat16* v_s = k_s + Bc * D; // [Bc, D] swizzled
+    __nv_bfloat16* qjl_s = TurboQuant ? v_s + Bc * D : q_s; // [Br, D] swizzled
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -156,8 +224,11 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const unsigned q_sbase = smem_addr(q_s);
     const unsigned k_sbase = smem_addr(k_s);
     const unsigned v_sbase = smem_addr(v_s);
+    const unsigned qjl_sbase = smem_addr(qjl_s);
     // Q A-fragment: row = warp_row0 + a_rowoff, col = k*16 + a_coloff.
     const unsigned q_lane_base = q_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * 512);
+    const unsigned qjl_lane_base =
+        qjl_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * 512);
     const unsigned q_as        = static_cast<unsigned>((a_mat >> 1) << 4);
     const unsigned q_r         = static_cast<unsigned>(a_rin << 4);
     // K B-fragment via ldmatrix.x4 (2 n-tiles/instr): lanes 16-31 fetch the +8-key
@@ -173,10 +244,33 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
 
-    // Stage Q into smem once via cp.async (overlaps with the K(0) prologue load
-    // below); it stays resident for the whole key loop. Global Q rows are 256 bf16
-    // contiguous, with a token stride of 256*QHeads.
-    {
+    // Stage Q once; TurboQuant rotates it in registers before writing the transient BF16 MMA
+    // operand, while the ordinary path retains the original cp.async pipeline.
+    if constexpr (TurboQuant) {
+        for (int row = warp; row < Br; row += Threads / 32) {
+            float qr[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int d = lane + 32 * i;
+                qr[i] = q0 + row < tokens
+                            ? __bfloat162float(
+                                  q[gqa_prefill_q_index<Geometry>(q_head, d, q0 + row)])
+                            : 0.0f;
+            }
+            tq_warp_polar_query(qr, lane);
+            float qjlr[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { qjlr[i] = qr[i]; }
+            tq_warp_qjl_query(qjlr, lane);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int d = lane + 32 * i;
+                q_s[row * D + gqa_prefill_swz(row, d)] = __float2bfloat16(qr[i]);
+                qjl_s[row * D + gqa_prefill_swz(row, d)] = __float2bfloat16(qjlr[i]);
+            }
+        }
+        __syncthreads();
+    } else {
         constexpr int VecPerRow      = D / 8;
         constexpr int QRowStride     = D * Geometry::QHeads; // global stride between tokens
         const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q0);
@@ -220,22 +314,36 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const float scale_l2 = scale * Log2E;
     int physical_page    = block_table[0];
 
-    // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
-    ninfer::ops::cp_commit();
-    gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
-    ninfer::ops::cp_commit();
+    // Prologue: ordinary BF16 overlaps Q/K copies; TurboQuant constructs the K MMA operand
+    // synchronously because its QJL Hadamard uses V shared memory as a ping-pong scratch plane.
+    if constexpr (TurboQuant) {
+        gqa_prefill_stage_tq_key<Geometry, Bc>(
+            k_s, v_s, static_cast<const std::uint8_t*>(cache_k), kv_head, 0, max_query_abs,
+            physical_page, tid);
+    } else {
+        ninfer::ops::cp_commit();
+        gqa_prefill_stage_kv<Geometry>(k_s, static_cast<const __nv_bfloat16*>(cache_k), kv_head, 0,
+                                       max_query_abs, physical_page, tid);
+        ninfer::ops::cp_commit();
+    }
 
     for (int kb = 0; kb < n_block_max; ++kb) {
         const int k0                 = kb * Bc;
-        const int next_physical_page = (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
+        const int next_physical_page =
+            (kb + 1 < n_block_max) ? block_table[((kb + 1) * Bc) >> kPagedKVPageShift]
+                                   : physical_page;
 
-        ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
-        __syncthreads();
+        if constexpr (!TurboQuant) {
+            ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
+            __syncthreads();
+        }
 
-        // Overlap V(kb) load against the QK MMA below.
-        gqa_prefill_stage_kv<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
-                                       tid);
-        ninfer::ops::cp_commit();
+        if constexpr (!TurboQuant) {
+            // Overlap V(kb) load against the QK MMA below.
+            gqa_prefill_stage_kv<Geometry>(v_s, static_cast<const __nv_bfloat16*>(cache_v), kv_head,
+                                           k0, max_query_abs, physical_page, tid);
+            ninfer::ops::cp_commit();
+        }
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
         // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
@@ -280,6 +388,50 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
                          af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
             }
+        }
+
+        if constexpr (TurboQuant) {
+            // QJL correction: (H D q_polar) dot sign(H D residual) * ||residual|| * c/m.
+            // Both operands are already resident in their 32/64-row transient shared tiles, so
+            // this is a second tensor-core contraction with no per-key inverse Hadamard.
+            unsigned qaf[2][4];
+            unsigned rbf[2][QKNt][2];
+            ldmatrix_x4(qaf[0][0], qaf[0][1], qaf[0][2], qaf[0][3],
+                        gqa_prefill_swz_addr(qjl_lane_base, 0u, q_as, q_r));
+#pragma unroll
+            for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                ldmatrix_x4(
+                    rbf[0][nt2][0], rbf[0][nt2][1], rbf[0][nt2 + 1][0], rbf[0][nt2 + 1][1],
+                    gqa_prefill_swz_addr(v_sbase + static_cast<unsigned>(nt2 * 4096), 0u, k_as,
+                                         k_r));
+            }
+#pragma unroll
+            for (int k = 0; k < QKKs; ++k) {
+                const int cur = k & 1;
+                const int nxt = cur ^ 1;
+                if (k + 1 < QKKs) {
+                    const unsigned ck = static_cast<unsigned>((k + 1) << 5);
+                    ldmatrix_x4(qaf[nxt][0], qaf[nxt][1], qaf[nxt][2], qaf[nxt][3],
+                                gqa_prefill_swz_addr(qjl_lane_base, ck, q_as, q_r));
+#pragma unroll
+                    for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                        ldmatrix_x4(
+                            rbf[nxt][nt2][0], rbf[nxt][nt2][1], rbf[nxt][nt2 + 1][0],
+                            rbf[nxt][nt2 + 1][1],
+                            gqa_prefill_swz_addr(v_sbase + static_cast<unsigned>(nt2 * 4096), ck,
+                                                 k_as, k_r));
+                    }
+                }
+#pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
+                             qaf[cur][0], qaf[cur][1], qaf[cur][2], qaf[cur][3],
+                             rbf[cur][nt][0], rbf[cur][nt][1]);
+                }
+            }
+            gqa_prefill_stage_tq_value<Geometry, Bc>(
+                v_s, static_cast<const std::uint8_t*>(cache_v), kv_head, k0, max_query_abs,
+                physical_page, tid);
         }
 
         const int row0             = warp_row0 + gid;
@@ -383,15 +535,20 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             acc[n][3] *= alpha1;
         }
 
-        ninfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
-        __syncthreads();
+        if constexpr (!TurboQuant) {
+            ninfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
+            __syncthreads();
+        }
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
-        if (kb + 1 < n_block_max) {
-            physical_page = next_physical_page;
-            gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
-                                           physical_page, tid);
-            ninfer::ops::cp_commit();
+        if constexpr (!TurboQuant) {
+            if (kb + 1 < n_block_max) {
+                physical_page = next_physical_page;
+                gqa_prefill_stage_kv<Geometry>(
+                    k_s, static_cast<const __nv_bfloat16*>(cache_k), kv_head, (kb + 1) * Bc,
+                    max_query_abs, physical_page, tid);
+                ninfer::ops::cp_commit();
+            }
         }
 
         // O += P V, contracting over the Bc keys. The (k, n) iteration space is
@@ -425,6 +582,15 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                      p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
             mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
                      p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
+        }
+        if constexpr (TurboQuant) {
+            __syncthreads();
+            if (kb + 1 < n_block_max) {
+                physical_page = next_physical_page;
+                gqa_prefill_stage_tq_key<Geometry, Bc>(
+                    k_s, v_s, static_cast<const std::uint8_t*>(cache_k), kv_head, (kb + 1) * Bc,
+                    max_query_abs, physical_page, tid);
+            }
         }
     }
 

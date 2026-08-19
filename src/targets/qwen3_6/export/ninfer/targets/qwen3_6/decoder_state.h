@@ -3,6 +3,7 @@
 #include "core/linear_attention_state.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
+#include "ninfer/ops/turboquant.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,9 @@
 namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::int32_t kKvQuantGroup = 64;
+inline constexpr std::int32_t kTurboQuantHeadDim = ops::turboquant::kHeadDim;
+inline constexpr std::int32_t kTurboQuantKeyBytes = ops::turboquant::kKeyBytes;
+inline constexpr std::int32_t kTurboQuantValueBytes = ops::turboquant::kValueBytes;
 
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;
@@ -19,6 +23,7 @@ struct DecoderStateSpec {
     std::int32_t kv_heads                   = 0;
     std::int32_t attention_head_dim         = 0;
     DType kv_dtype                          = DType::BF16;
+    KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     std::int32_t kv_quant_group             = 0;
     bool kv_packed_v                        = false;
     bool kv_rotate_k                        = false;
@@ -37,6 +42,7 @@ struct PagedKVCacheLayout {
     std::int32_t kv_heads     = 0;
     std::int32_t head_dim     = 0;
     DType dtype               = DType::BF16;
+    KvCacheStorage storage    = KvCacheStorage::BFloat16;
     std::int32_t quant_group  = 0;
     bool packed_v             = false;
     bool rotate_k             = false;
@@ -95,6 +101,7 @@ private:
     std::int32_t kv_heads_     = 0;
     std::int32_t head_dim_     = 0;
     DType dtype_               = DType::BF16;
+    KvCacheStorage storage_    = KvCacheStorage::BFloat16;
     std::int32_t quant_group_  = 0;
     bool packed_v_             = false;
     bool rotate_k_             = false;

@@ -97,6 +97,7 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
     if (storage == ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
         return "rotated-k8-v4-group64";
     }
+    if (storage == ninfer::KvCacheStorage::TurboQuant) { return "turboquant-polar3-qjl1"; }
     return "int8-group64";
 }
 

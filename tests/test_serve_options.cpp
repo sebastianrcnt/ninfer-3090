@@ -62,6 +62,10 @@ int main() {
         "--kv-dtype rk8v4 did not select rotated K8/V4 storage");
     failures += check(defaults.kv_cache == ninfer::KvCacheStorage::BFloat16,
                       "rk8v4 unexpectedly changed the default KV storage");
+    const ServeOptions turboquant =
+        parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "turboquant"});
+    failures += check(turboquant.kv_cache == ninfer::KvCacheStorage::TurboQuant,
+                      "--kv-dtype turboquant did not select PolarQuant/QJL storage");
 
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
