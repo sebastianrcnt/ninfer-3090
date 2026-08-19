@@ -33,10 +33,10 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  kGqaPrefillSmemBytes);
         CUDA_CHECK(attr_tq);
-        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
+        const dim3 attention_grid(static_cast<unsigned>(Geometry::QHeads),
+                                  static_cast<unsigned>(div_up(tokens, kGqaPrefillTqBr)), 1u);
         gqa_attention_prefill_bf16_kernel<Geometry, true, Metadata>
-            <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
+            <<<attention_grid, kGqaPrefillTqThreads, kGqaPrefillSmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), cache_k.data, cache_v.data, metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);

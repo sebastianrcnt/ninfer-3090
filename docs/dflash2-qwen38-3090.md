@@ -3,9 +3,11 @@
 Status: complete for the RTX 3090 single-user target. The final lossless DFlash 2 path reaches
 103.5 tok/s on GSM8K and 94.2 tok/s on HumanEval using kernel changes only.
 
-TurboQuant extension status: implemented and serving at 262K capacity; 32K quality passes, but
-the strict 98K/262K serving-quality matrix and the no-throughput-regression contract are not yet
-closed.  Do not read the completed DFlash 2 status above as completion of this later extension.
+TurboQuant extension status: implemented and serving at 262K capacity.  Mixed Korean, English,
+code, and arithmetic retrieval passes at 31.5K, 97.9K, and 261.9K, and a 512-token DFlash decode
+is stable.  The strict no-throughput-regression contract is still open: at 31.5K, TurboQuant
+prefill is 715.7 tok/s versus the same-harness INT8 result of 839.7 tok/s (-14.8%).  Do not read
+the completed DFlash 2 status above as completion of this later extension.
 
 Hardware: one RTX 3090 (GA102, `sm_86`, 24 GiB, 936 GB/s), driver 590.48.01, CUDA 13.1.
 Target artifact: `qwen3_8_27b.ninfer`, 18,210,531,328 B on disk, 16.67 GiB resident.
@@ -385,16 +387,18 @@ persistent BF16 expansion cache and no extra target-weight read.
 * Append performs the signed Hadamard, Polar tree quantization, and QJL residual projection
   directly into the paged byte planes.
 * T=1..8 uses one fused CTA per KV head/split.  It decodes each packed K/V tile once for every
-  query position, performs the Polar and QJL products with `sm_86` BF16 Tensor Core MMA, keeps
-  online-softmax/value accumulation in FP32 registers, and is independently CUDA-Graph
-  capturable for every fixed width.  It uses the same exact 16-coordinate tree decoder and a
-  one-time QJL dual query transform; the latter is supplied through opt-in dynamic shared memory
-  so T=6..8 does not exceed GA102's static-shared-memory ceiling.
-* Prompt attention is FlashAttention-style with 64 query rows and 32 packed key rows per CTA.
-  The QJL dual transform is applied once per query row, so the packed sign plane feeds a second
-  MMA without reconstructing each cached key.  A 16-coordinate exact tree decoder shares the
-  Polar prefix while preserving each coordinate's multiplication order; this reduced the
-  profiled 128-token prompt kernel from 7.351 ms to **1.467 ms** (5.01x).
+  query position, reconstructs each cached key's QJL residual once in registers and folds it into
+  the Polar key tile, then uses one `sm_86` BF16 Tensor Core QK contraction.  Online softmax/value
+  accumulation remains FP32, every fixed width is independently CUDA-Graph capturable, and the
+  final route requires no dynamic QJL shared-memory plane.
+* Prompt attention is FlashAttention-style with 128 query rows and 64 packed key rows per CTA.
+  The QJL residual is reconstructed once per cached key and folded into the transient Polar key,
+  replacing the second QJL QK contraction with one BF16 Tensor Core MMA.  A scalar, exact
+  16-coordinate tree decoder preserves each coordinate's multiplication order without the old
+  dynamically indexed `float[16]` local stack; centroid tables reside in device constant memory.
+  Query-head is the fastest grid axis so the six GQA siblings reuse nearby packed KV cache lines.
+  The final T=128 kernel is about 126 us, and a T=4096 one-layer benchmark improved from 14.83 to
+  14.43 ms after the cache-local grid ordering.
 * INT8/BF16 dispatch and their kernels are unchanged and remain available as fallback modes.
 
 The DFlash 2 artifact has five local-attention layers and no full-attention drafter layer.  The
@@ -412,9 +416,9 @@ tokens, and one request in flight.  Startup reports:
 |---|---:|
 | resolved KV capacity | 262,144 tokens / 4,096 pages |
 | runtime reservation | 4.46 GiB |
-| free after target weights | 4.87 GiB |
-| free after startup | **435.94 MiB** |
-| allocator slack | 417.53 MiB |
+| free after target weights | 4.98 GiB |
+| free after startup | **547.94 MiB** |
+| allocator slack | 529.53 MiB |
 | CUDA Graph use / allowance | 12.00 / 32.00 MiB |
 
 This exceeds the required 300 MiB device headroom while the desktop and Sunshine remain in their
@@ -424,8 +428,8 @@ normal state.
 
 | Check | Result |
 |---|---|
-| packed A1 vs FP64 causal attention | relative L2 0.231508 |
-| 128-token, two-page prompt vs FP64 causal attention | relative L2 0.234337 |
+| packed A1 vs FP64 causal attention | relative L2 0.231507 |
+| 128-token, two-page prompt vs FP64 causal attention | relative L2 0.234214 |
 | append determinism and A1/A3 packed-cache parity | bit-identical |
 | CUDA Graph replay, every T=1..8 | bit-identical to eager |
 | logical page 4,095 / position 262,143 append + decode | finite output, pass |
@@ -433,48 +437,54 @@ normal state.
 | Qwen runtime mechanism checks | pass |
 | real target + real DFlash 2 greedy losslessness | **PASS**, three prompt families |
 
-The final complete 88-entry suite took 116.11 seconds and retains exactly the eight documented
+The final complete 88-entry suite took 143.70 seconds and retains exactly the eight documented
 `sm_86`/NVFP4 and 1e-5 baseline failures; TurboQuant adds no regression.  Eight optional/real
 artifact tests skip without their environment variables; the real DFlash 2 test was also run
 separately with both artifacts and passed.
 
 ### Serving-path context validation
 
-The 31,485-token test places independent Korean, English, Python-expression, and arithmetic
-needles across the prompt.  Greedy generation with thinking disabled recovered all four values
-exactly: `해오라기-7319`, `cobalt-orbit-4821`, `x*x+1`, and `1591`.
+The reproducible harness `tools/bench/run_long_context_retrieval.py` distributes independent
+Korean, English, Python-expression, and arithmetic needles through the prompt.  Greedy generation
+with thinking disabled recovered all four values exactly at every measured extent:
+`해오라기-7319`, `cobalt-orbit-4821`, `x*x+1`, and `1591`.
 
-| Context | Result | prefill | decode | wall |
-|---:|---|---:|---:|---:|
-| 31,485 | all four exact | 62.7 tok/s | 3.5 tok/s | 513.3 s |
+| Input context | Result | prefill | decode | TTFT | wall | DFlash |
+|---:|---|---:|---:|---:|---:|---:|
+| 31,445 | all four exact | **715.7 tok/s** | **31.7 tok/s** | 43.98 s | 45.18 s | 3.55 tok/round |
+| 97,945 | all four exact | **452.8 tok/s** | **16.2 tok/s** | 216.45 s | 218.79 s | 3.90 tok/round |
+| 261,953 | all four exact | **242.0 tok/s** | **7.3 tok/s** | 1083.00 s | 1088.17 s | 3.25 tok/round |
 
-The tree/QJL small-T rewrite improved the same 32K decode from 0.7 to 3.5 tok/s (5.0x).  Short
-production prompts measured 49.0 / 114.2 / 92.8 / 65.4 tok/s (Korean math / English / code /
-Korean factual; 80.4 tok/s mean), with every answer correct.  The 98K serving-path extension and
-262K endpoint/stability coverage follow the same exact prefix; any throughput comparison must use
-the same context length because full-attention cost grows with the visible KV length.
+The same 31.5K harness on INT8 KV measured 839.7 tok/s prefill and 32.8 tok/s decode.  TurboQuant
+therefore remains 14.8% behind in prefill and 3.4% behind in that request's observed decode; the
+latter varies with DFlash acceptance and has also measured 34.6 tok/s on TurboQuant.  Relative to
+the earlier stack-free TurboQuant implementation, Br=128 raises 31.5K prefill from 575.4 to
+715.7 tok/s and 97.9K prefill from 311.4 to 452.8 tok/s.
 
-A 97,885-token request was sampled far enough to confirm normal prefill and then cancelled cleanly:
-the stateless Chat Completions path did not retain the preceding 32K KV, and the measured quadratic
-growth projected roughly 80 minutes for that single request.  It is not counted as a 98K quality
-pass.  Position 262,143 is covered by the direct packed append/decode test, but that is likewise
-not a substitute for the still-open 262K Needle/RULER serving run.
+A separate short-context stability request generated exactly 512 tokens and stopped at the output
+limit: 39 input tokens, 128.5 tok/s decode, 7.97 tok/round (99.6% acceptance), and 4.17 s wall time.
+This is above the pre-TurboQuant short-prompt GSM8K result of 103.5 tok/s and confirms that the
+small-T CUDA Graph/DFlash path is not the remaining throughput blocker.  Full-attention prefill is.
 
-### Optional follow-up work
+Rejected prompt experiments are recorded so they are not repeated: Bc=32 was slower; CTA-wide and
+warp-private packed staging reduced uncoalesced transactions but increased spills and latency;
+sequential low-register QK loads were neutral; pairing two query heads at 64 rows preserved the
+same 128-row reuse and was slightly slower; and reconstruct-then-INT8 QK added 11-12% latency.
 
-The goal is complete. Remaining research items are not required for the accepted throughput:
+### Remaining work
 
-1. Improve the Q5 side of GDN while preserving the exact reduction order; Q4-only work cannot move
-   its critical path.
-2. Investigate MT-Bench acceptance (3.34 tokens/round versus the model card's 4.10).
-3. Measure a BF16 drafter at a reduced KV capacity; it does not fit at the production capacity.
-4. Re-negotiate any 130 tok/s target before investing in a full operator rewrite.
+The DFlash 2 goal is complete, but the TurboQuant extension is not complete until its 31.5K
+prefill closes the remaining 14.8% gap to INT8 (or that criterion is explicitly renegotiated).
+The next optimization must reduce packed Polar/QJL prompt-consumer cost; decode, capacity,
+retrieval quality, CUDA Graph stability, and DFlash losslessness are already closed.  Q4-only GDN
+scheduling and extra dequantization magic-number work are known dead ends for the separate
+short-context DFlash ceiling described above.
 
 ## Verification status
 
-Final `ctest` on this build (`sm_86`, CUDA 13.1): **86 entries: 70 passed, 8 skipped, and the
-same 8 baseline failures**, 106.38 s. No new failure was introduced. The suite was run in the
-CUDA container with the source tree mounted at `/src`, `--cap-add SYS_ADMIN`, and user `0:0`.
+Final `ctest` on this build (`sm_86`, CUDA 13.1): **88 entries: 72 passed, 8 skipped, and the
+same 8 baseline failures**, 143.70 s. No new failure was introduced. The suite was run in the
+CUDA container with the source tree mounted at `/src` and one test process at a time.
 
 | Added test | Result |
 |---|---|
@@ -493,11 +503,10 @@ NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=<drafter>.ninfer \
   build/tests/ninfer_qwen3_8_27b_dflash2_real_test
 ```
 
-The eight standing failures are unchanged and unrelated. Three direct NVFP4 tests
-(`#70`, `#81`, `#85`) reject the Blackwell-only A4 format, four projection tests
-(`#72`-`#75`) abort when their NVFP4 coverage reaches the same `sm_120a` requirement, and
-`ninfer_gdn_gating_proj_test` (`#45`) misses its reduction criterion by about 1e-5. The
-repository's declared toolchain is RTX 5090 / `sm_120a`.
+The eight standing failures are unchanged and unrelated. Tests #72, #74-#77, #83, and #87 reject
+or abort on the Blackwell-only NVFP4 A4 / `sm_120a` format, and
+`ninfer_gdn_gating_proj_test` (#46) misses its reduction criterion by about 1e-5. The repository's
+declared upstream toolchain is RTX 5090 / `sm_120a`.
 
 MTP and the ordinary decode path are untouched: DFlash 2 branches on
 `DFlashConfig::convolution` and `DFlashConfig::selector`, both false for Qwen3.6-35B-A3B, whose
@@ -507,7 +516,10 @@ DFlash 1 schedule, fused projections, and graph allowance are unchanged.
 
 Development builds run in a CUDA 13.1.2 container with the source bind-mounted, the build tree on
 the system SSD, and ccache on the 2 TB spindle, so an edit/compile cycle does not repeat a full
-CUDA configure. The shipping `Dockerfile` is unchanged.
+CUDA configure. `NVCC_PREPEND_FLAGS=--split-compile=6` parallelizes device optimization inside the
+large CUDA translation units; the prompt TU rebuild fell to roughly 47 seconds on this host. Set
+`CUDA_SPLIT_COMPILE=1` in the local `devbuild.sh` to disable it for compiler diagnostics. The
+shipping `Dockerfile` is unchanged.
 
 ```bash
 cmake -S /src -B /build -G Ninja \

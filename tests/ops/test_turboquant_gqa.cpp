@@ -298,6 +298,81 @@ int run_prompt() {
     return 0;
 }
 
+int run_prompt_benchmark(int tokens, int iterations) {
+    if (tokens <= 0 || tokens > 16384 || iterations <= 0) {
+        throw std::invalid_argument("TurboQuant benchmark arguments out of range");
+    }
+    const int pages = (tokens + kPagedKVPageSize - 1) / kPagedKVPageSize;
+    std::vector<float> q(static_cast<std::size_t>(kD) * kQH * tokens);
+    std::vector<float> k(static_cast<std::size_t>(kD) * kKVH * tokens);
+    std::vector<float> v(static_cast<std::size_t>(kD) * kKVH * tokens);
+    fill_uniform(q, 7401, -0.3f, 0.3f);
+    fill_uniform(k, 7402, -0.3f, 0.3f);
+    fill_uniform(v, 7403, -1.0f, 1.0f);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    round_to_bf16(v);
+    std::vector<std::int32_t> positions(tokens);
+    std::iota(positions.begin(), positions.end(), 0);
+    std::vector<std::int32_t> table(pages);
+    std::iota(table.begin(), table.end(), 0);
+
+    DeviceBuffer dq = to_device_bf16(q);
+    DeviceBuffer dk = to_device_bf16(k);
+    DeviceBuffer dv = to_device_bf16(v);
+    DeviceBuffer dp = to_device(positions);
+    DeviceBuffer dt = to_device(table);
+    DeviceBuffer key(static_cast<std::size_t>(ops::turboquant::kKeyBytes) *
+                     kPagedKVPageSize * kKVH * pages);
+    DeviceBuffer value(static_cast<std::size_t>(ops::turboquant::kValueBytes) *
+                       kPagedKVPageSize * kKVH * pages);
+    DeviceBuffer output(static_cast<std::size_t>(kD) * kQH * tokens * sizeof(std::uint16_t));
+    PagedKVLayerView cache{
+        .k_pages = Tensor(key.p, DType::U8,
+                          {ops::turboquant::kKeyBytes, kPagedKVPageSize, kKVH, pages}),
+        .v_pages = Tensor(value.p, DType::U8,
+                          {ops::turboquant::kValueBytes, kPagedKVPageSize, kKVH, pages}),
+        .block_table = Tensor(dt.p, DType::I32, {pages}),
+        .head_dim = kD,
+        .num_kv_heads = kKVH,
+        .dtype = DType::U8,
+        .storage = KvCacheStorage::TurboQuant,
+    };
+    Tensor tq(dq.p, DType::BF16, {kD, kQH, tokens});
+    Tensor tk(dk.p, DType::BF16, {kD, kKVH, tokens});
+    Tensor tv(dv.p, DType::BF16, {kD, kKVH, tokens});
+    Tensor tp(dp.p, DType::I32, {tokens});
+    Tensor out(output.p, DType::BF16, {kD, kQH, tokens});
+    const ops::GqaExecutionEnvelope envelope{1, static_cast<std::uint32_t>(tokens)};
+    const std::size_t workspace_bytes =
+        ops::gqa_attention_workspace_capacity_bytes(kQH, DType::U8, envelope, 1, tokens, tokens);
+    DeviceBuffer workspace_storage(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_storage.p, workspace_storage.bytes});
+
+    ops::gqa_kv_append(tk, tv, tp, cache, nullptr);
+    workspace.reset();
+    ops::gqa_attention_cached(tq, tp, 0.0625f, cache, envelope, workspace, out, nullptr);
+    cuda_synchronize();
+
+    cudaEvent_t begin = nullptr, end = nullptr;
+    cuda_check(cudaEventCreate(&begin), "create benchmark begin event");
+    cuda_check(cudaEventCreate(&end), "create benchmark end event");
+    cuda_check(cudaEventRecord(begin), "record benchmark begin");
+    for (int i = 0; i < iterations; ++i) {
+        workspace.reset();
+        ops::gqa_attention_cached(tq, tp, 0.0625f, cache, envelope, workspace, out, nullptr);
+    }
+    cuda_check(cudaEventRecord(end), "record benchmark end");
+    cuda_check(cudaEventSynchronize(end), "synchronize benchmark end");
+    float milliseconds = 0.0f;
+    cuda_check(cudaEventElapsedTime(&milliseconds, begin, end), "measure benchmark events");
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+    std::cout << "TurboQuant prompt benchmark T=" << tokens << " iterations=" << iterations
+              << " mean_ms=" << milliseconds / iterations << '\n';
+    return 0;
+}
+
 int run_max_logical_address() {
     constexpr int kLogicalPages = 262144 / kPagedKVPageSize;
     constexpr int kPosition = 262144 - 1;
@@ -354,6 +429,13 @@ int main() {
         if (cuda_unavailable()) {
             std::cout << "turboquant_gqa: SKIP (CUDA unavailable)\n";
             return 77;
+        }
+        if (const char* value = std::getenv("NINFER_TQ_BENCH_T")) {
+            const int tokens = std::atoi(value);
+            const char* iteration_value = std::getenv("NINFER_TQ_BENCH_ITERS");
+            return run_prompt_benchmark(tokens,
+                                        iteration_value == nullptr ? 5
+                                                                   : std::atoi(iteration_value));
         }
         const int failures = run() + run_prompt() + run_max_logical_address();
         if (failures != 0) { return 1; }

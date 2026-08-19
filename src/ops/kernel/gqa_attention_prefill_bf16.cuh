@@ -99,38 +99,37 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
 
 template <typename Geometry, int Bc>
 __device__ __forceinline__ void gqa_prefill_stage_tq_key(
-    __nv_bfloat16* polar_dst, __nv_bfloat16* qjl_dst, const std::uint8_t* cache, int kv_head,
-    int k0, int max_query_abs, int physical_page, int tid) {
+    __nv_bfloat16* dst, const std::uint8_t* cache, int kv_head, int k0, int max_query_abs,
+    int physical_page, int tid) {
     constexpr int D       = kGqaPrefillHeadDim;
-    constexpr int Threads = kGqaPrefillThreads;
-    constexpr float kQjlFactor  = 0.00489575835f;
-
-    constexpr int Groups = D / 16;
+    constexpr int Threads = kGqaPrefillTqThreads;
+    constexpr int Groups  = D / 16;
     for (int task = tid; task < Bc * Groups; task += Threads) {
-        const int key_l = task / Groups;
+        const int key_l  = task / Groups;
         const int d_base = (task - key_l * Groups) * 16;
-        const int key   = k0 + key_l;
-        float polar[16]{};
-        const std::uint8_t* row = nullptr;
-        float gamma_factor = 0.0f;
+        const int key    = k0 + key_l;
         if (key <= max_query_abs) {
-            row = cache + paged_kv_element_offset<tq::kKeyBytes, Geometry::KVHeads>(
-                              physical_page, kv_head, (k0 & kPagedKVPageMask) + key_l, 0);
-            tq_decode_block16(row, d_base, polar);
-            const float gamma =
-                __half2float(*reinterpret_cast<const __half*>(row + tq::kQjlNormOffset));
-            gamma_factor = gamma * kQjlFactor;
-        }
+            const std::uint8_t* row =
+                cache + paged_kv_element_offset<tq::kKeyBytes, Geometry::KVHeads>(
+                            physical_page, kv_head, (k0 & kPagedKVPageMask) + key_l, 0);
+            tq_decode_block16_store<true>(row, d_base, dst + key_l * D, key_l);
+        } else {
 #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            const int d = d_base + i;
-            const unsigned bit = row == nullptr
-                                     ? 0U
-                                     : (row[tq::kQjlSignsOffset + (d >> 3)] >> (d & 7)) & 1U;
-            polar_dst[key_l * D + gqa_prefill_swz(key_l, d)] = __float2bfloat16(polar[i]);
-            qjl_dst[key_l * D + gqa_prefill_swz(key_l, d)] =
-                __float2bfloat16(row == nullptr ? 0.0f
-                                                : (bit ? gamma_factor : -gamma_factor));
+            for (int i = 0; i < 16; ++i) {
+                const int d = d_base + i;
+                dst[key_l * D + gqa_prefill_swz(key_l, d)] = __float2bfloat16(0.0f);
+            }
+        }
+    }
+    __syncthreads();
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    for (int key_l = warp; key_l < Bc; key_l += Threads / 32) {
+        if (k0 + key_l <= max_query_abs) {
+            const std::uint8_t* row =
+                cache + paged_kv_element_offset<tq::kKeyBytes, Geometry::KVHeads>(
+                            physical_page, kv_head, (k0 & kPagedKVPageMask) + key_l, 0);
+            tq_warp_add_qjl_residual<true>(row, dst + key_l * D, key_l, lane);
         }
     }
     __syncthreads();
@@ -141,33 +140,34 @@ __device__ __forceinline__ void gqa_prefill_stage_tq_value(
     __nv_bfloat16* dst, const std::uint8_t* cache, int kv_head, int k0, int max_query_abs,
     int physical_page, int tid) {
     constexpr int D       = kGqaPrefillHeadDim;
-    constexpr int Threads = kGqaPrefillThreads;
-    constexpr int Groups = D / 16;
+    constexpr int Threads = kGqaPrefillTqThreads;
+    constexpr int Groups  = D / 16;
     for (int task = tid; task < Bc * Groups; task += Threads) {
-        const int key_l = task / Groups;
+        const int key_l  = task / Groups;
         const int d_base = (task - key_l * Groups) * 16;
-        const int key   = k0 + key_l;
-        float values[16]{};
+        const int key    = k0 + key_l;
         if (key <= max_query_abs) {
             const std::uint8_t* row =
                 cache + paged_kv_element_offset<tq::kValueBytes, Geometry::KVHeads>(
                             physical_page, kv_head, (k0 & kPagedKVPageMask) + key_l, 0);
-            tq_decode_block16(row, d_base, values);
-        }
+            tq_decode_block16_store<true>(row, d_base, dst + key_l * D, key_l);
+        } else {
 #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            const int d = d_base + i;
-            dst[key_l * D + gqa_prefill_swz(key_l, d)] = __float2bfloat16(values[i]);
+            for (int i = 0; i < 16; ++i) {
+                const int d = d_base + i;
+                dst[key_l * D + gqa_prefill_swz(key_l, d)] = __float2bfloat16(0.0f);
+            }
         }
     }
     __syncthreads();
 }
 
-// FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
-// (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
+// FlashAttention-2 forward, one CTA per (query row block, query head). TurboQuant uses 128 rows
+// so each packed K/V decode is reused twice as broadly; BF16 retains its 64-row schedule.
+// seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
 template <typename Geometry, bool TurboQuant, typename Metadata>
-__launch_bounds__(kGqaPrefillThreads, 1) __global__
+__launch_bounds__(TurboQuant ? kGqaPrefillTqThreads : kGqaPrefillThreads, 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const void* __restrict__ cache_k,
                                            const void* __restrict__ cache_v,
@@ -175,9 +175,9 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                                            const std::int32_t* __restrict__ positions, float scale,
                                            __nv_bfloat16* __restrict__ out, std::int32_t width) {
     constexpr int D             = kGqaPrefillHeadDim; // 256
-    constexpr int Br            = kGqaPrefillBr;      // 64 query rows
-    constexpr int Bc            = TurboQuant ? 32 : kGqaPrefillBc;
-    constexpr int Threads       = kGqaPrefillThreads; // 128
+    constexpr int Br            = TurboQuant ? kGqaPrefillTqBr : kGqaPrefillBr;
+    constexpr int Bc            = kGqaPrefillBc;
+    constexpr int Threads       = TurboQuant ? kGqaPrefillTqThreads : kGqaPrefillThreads;
     constexpr int QKNt          = Bc / 8;             // 8  QK score n-tiles
     constexpr int QKKs          = D / 16;             // 16 QK contraction steps over head_dim
     constexpr int PVNt          = D / 8;              // 32 PV output n-tiles
@@ -185,16 +185,17 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
-    static_assert(Threads == 128);
+    static_assert(Threads == 128 || Threads == 256);
 
     extern __shared__ __align__(16) __nv_bfloat16 gqa_smem[];
     __nv_bfloat16* q_s = gqa_smem;     // [Br, D] swizzled
     __nv_bfloat16* k_s = q_s + Br * D; // [Bc, D] swizzled
-    __nv_bfloat16* v_s = k_s + Bc * D; // [Bc, D] swizzled
-    __nv_bfloat16* qjl_s = TurboQuant ? v_s + Bc * D : q_s; // [Br, D] swizzled
+    __nv_bfloat16* v_s = TurboQuant ? k_s : k_s + Bc * D; // [Bc, D] swizzled
 
-    const int q_block = static_cast<int>(blockIdx.x);
-    const int q_head  = static_cast<int>(blockIdx.y);
+    // Put query-head on the fastest grid axis. Adjacent CTAs then consume the same packed KV head
+    // (GroupSize query heads per KV head), allowing long-context tiles to reuse L2 cache lines.
+    const int q_head  = static_cast<int>(TurboQuant ? blockIdx.x : blockIdx.y);
+    const int q_block = static_cast<int>(TurboQuant ? blockIdx.y : blockIdx.x);
     const int tid     = static_cast<int>(threadIdx.x);
     const int warp    = tid >> 5;
     const int lane    = tid & 31;
@@ -224,11 +225,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const unsigned q_sbase = smem_addr(q_s);
     const unsigned k_sbase = smem_addr(k_s);
     const unsigned v_sbase = smem_addr(v_s);
-    const unsigned qjl_sbase = smem_addr(qjl_s);
     // Q A-fragment: row = warp_row0 + a_rowoff, col = k*16 + a_coloff.
     const unsigned q_lane_base = q_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * 512);
-    const unsigned qjl_lane_base =
-        qjl_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * 512);
     const unsigned q_as        = static_cast<unsigned>((a_mat >> 1) << 4);
     const unsigned q_r         = static_cast<unsigned>(a_rin << 4);
     // K B-fragment via ldmatrix.x4 (2 n-tiles/instr): lanes 16-31 fetch the +8-key
@@ -258,15 +256,10 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                             : 0.0f;
             }
             tq_warp_polar_query(qr, lane);
-            float qjlr[8];
-#pragma unroll
-            for (int i = 0; i < 8; ++i) { qjlr[i] = qr[i]; }
-            tq_warp_qjl_query(qjlr, lane);
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const int d = lane + 32 * i;
                 q_s[row * D + gqa_prefill_swz(row, d)] = __float2bfloat16(qr[i]);
-                qjl_s[row * D + gqa_prefill_swz(row, d)] = __float2bfloat16(qjlr[i]);
             }
         }
         __syncthreads();
@@ -314,11 +307,10 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const float scale_l2 = scale * Log2E;
     int physical_page    = block_table[0];
 
-    // Prologue: ordinary BF16 overlaps Q/K copies; TurboQuant constructs the K MMA operand
-    // synchronously because its QJL Hadamard uses V shared memory as a ping-pong scratch plane.
+    // Prologue: ordinary BF16 overlaps Q/K copies; TurboQuant constructs its packed K operand.
     if constexpr (TurboQuant) {
         gqa_prefill_stage_tq_key<Geometry, Bc>(
-            k_s, v_s, static_cast<const std::uint8_t*>(cache_k), kv_head, 0, max_query_abs,
+            k_s, static_cast<const std::uint8_t*>(cache_k), kv_head, 0, max_query_abs,
             physical_page, tid);
     } else {
         ninfer::ops::cp_commit();
@@ -357,15 +349,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         // Swizzled ldmatrix addresses via precomputed per-lane bases + immediates.
         unsigned af[2][4];
         unsigned bf[2][QKNt][2];
-        {
-            ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
-                        gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
+        ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
+                    gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
 #pragma unroll
-            for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
-                ldmatrix_x4(bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0], bf[0][nt2 + 1][1],
-                            gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2 * 4096),
-                                                 0u, k_as, k_r));
-            }
+        for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+            ldmatrix_x4(bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0],
+                        bf[0][nt2 + 1][1],
+                        gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2 * 4096),
+                                             0u, k_as, k_r));
         }
 #pragma unroll
         for (int k = 0; k < QKKs; ++k) {
@@ -377,10 +368,11 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                             gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
 #pragma unroll
                 for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
-                    ldmatrix_x4(
-                        bf[nxt][nt2][0], bf[nxt][nt2][1], bf[nxt][nt2 + 1][0], bf[nxt][nt2 + 1][1],
-                        gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2 * 4096), ck,
-                                             k_as, k_r));
+                    ldmatrix_x4(bf[nxt][nt2][0], bf[nxt][nt2][1], bf[nxt][nt2 + 1][0],
+                                bf[nxt][nt2 + 1][1],
+                                gqa_prefill_swz_addr(
+                                    k_lane_base + static_cast<unsigned>(nt2 * 4096), ck, k_as,
+                                    k_r));
                 }
             }
 #pragma unroll
@@ -391,44 +383,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         }
 
         if constexpr (TurboQuant) {
-            // QJL correction: (H D q_polar) dot sign(H D residual) * ||residual|| * c/m.
-            // Both operands are already resident in their 32/64-row transient shared tiles, so
-            // this is a second tensor-core contraction with no per-key inverse Hadamard.
-            unsigned qaf[2][4];
-            unsigned rbf[2][QKNt][2];
-            ldmatrix_x4(qaf[0][0], qaf[0][1], qaf[0][2], qaf[0][3],
-                        gqa_prefill_swz_addr(qjl_lane_base, 0u, q_as, q_r));
-#pragma unroll
-            for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
-                ldmatrix_x4(
-                    rbf[0][nt2][0], rbf[0][nt2][1], rbf[0][nt2 + 1][0], rbf[0][nt2 + 1][1],
-                    gqa_prefill_swz_addr(v_sbase + static_cast<unsigned>(nt2 * 4096), 0u, k_as,
-                                         k_r));
-            }
-#pragma unroll
-            for (int k = 0; k < QKKs; ++k) {
-                const int cur = k & 1;
-                const int nxt = cur ^ 1;
-                if (k + 1 < QKKs) {
-                    const unsigned ck = static_cast<unsigned>((k + 1) << 5);
-                    ldmatrix_x4(qaf[nxt][0], qaf[nxt][1], qaf[nxt][2], qaf[nxt][3],
-                                gqa_prefill_swz_addr(qjl_lane_base, ck, q_as, q_r));
-#pragma unroll
-                    for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
-                        ldmatrix_x4(
-                            rbf[nxt][nt2][0], rbf[nxt][nt2][1], rbf[nxt][nt2 + 1][0],
-                            rbf[nxt][nt2 + 1][1],
-                            gqa_prefill_swz_addr(v_sbase + static_cast<unsigned>(nt2 * 4096), ck,
-                                                 k_as, k_r));
-                    }
-                }
-#pragma unroll
-                for (int nt = 0; nt < QKNt; ++nt) {
-                    mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3],
-                             qaf[cur][0], qaf[cur][1], qaf[cur][2], qaf[cur][3],
-                             rbf[cur][nt][0], rbf[cur][nt][1]);
-                }
-            }
+            __syncthreads(); // QK must release the shared key tile before V overwrites it.
             gqa_prefill_stage_tq_value<Geometry, Bc>(
                 v_s, static_cast<const std::uint8_t*>(cache_v), kv_head, k0, max_query_abs,
                 physical_page, tid);
@@ -588,7 +543,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             if (kb + 1 < n_block_max) {
                 physical_page = next_physical_page;
                 gqa_prefill_stage_tq_key<Geometry, Bc>(
-                    k_s, v_s, static_cast<const std::uint8_t*>(cache_k), kv_head, (kb + 1) * Bc,
+                    k_s, static_cast<const std::uint8_t*>(cache_k), kv_head, (kb + 1) * Bc,
                     max_query_abs, physical_page, tid);
             }
         }

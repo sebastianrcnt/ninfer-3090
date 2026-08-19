@@ -227,16 +227,8 @@ void launch_turboquant_partial(const Tensor& q, CacheInput input, const Tensor& 
         CUDA_CHECK(cudaGetLastError());
     }
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-    constexpr int kRows = TokenTile * Geometry::GroupSize;
-    constexpr int kMmaRows = ((kRows + 15) / 16) * 16;
-    constexpr std::size_t kQjlSharedBytes =
-        static_cast<std::size_t>(kMmaRows) * turboquant::kHeadDim * sizeof(__nv_bfloat16);
-    static const cudaError_t attr = cudaFuncSetAttribute(
-        gqa_turboquant_mma_attention_kernel<Geometry, TokenTile>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kQjlSharedBytes));
-    CUDA_CHECK(attr);
     gqa_turboquant_mma_attention_kernel<Geometry, TokenTile>
-        <<<grid, 256, kQjlSharedBytes, stream>>>(
+        <<<grid, 256, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), static_cast<const std::int32_t*>(pos.data),
             static_cast<const std::uint8_t*>(cache.k_pages.data),
             static_cast<const std::uint8_t*>(cache.v_pages.data),

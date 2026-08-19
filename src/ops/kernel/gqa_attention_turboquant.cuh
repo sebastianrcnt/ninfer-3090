@@ -15,8 +15,10 @@ namespace ninfer::ops {
 
 namespace tq = turboquant;
 
-__device__ __forceinline__ float tq_centroid(int level, int code) {
-    constexpr float table[8][8] = {
+// Namespace-scope constant tables are essential here.  A function-local constexpr table with
+// runtime indices is materialized on the per-thread stack by ptxas, and the decoder calls these
+// lookups for every cached row.  Constant memory keeps the immutable 768-byte codebook resident.
+static __device__ __constant__ float kTqCentroid[8][8] = {
         {0.392699082f, 1.178097245f, 1.963495408f, 2.748893572f, 3.534291735f,
          4.319689899f, 5.105088062f, 5.890486225f},
         {0.188449608f, 0.379996302f, 0.548254940f, 0.707229964f, 0.863566363f,
@@ -33,12 +35,13 @@ __device__ __forceinline__ float tq_centroid(int level, int code) {
          0.832533818f, 0.869081041f, 0.919025636f},
         {0.690600431f, 0.726114351f, 0.752027142f, 0.774576457f, 0.796219870f,
          0.818769185f, 0.844681976f, 0.880195896f},
-    };
-    return table[level - 1][code];
+};
+
+__device__ __forceinline__ float tq_centroid(int level, int code) {
+    return kTqCentroid[level - 1][code];
 }
 
-__device__ __forceinline__ float tq_sin_centroid(int level, int code) {
-    constexpr float table[8][8] = {
+static __device__ __constant__ float kTqSinCentroid[8][8] = {
         {0.382683433f, 0.923879532f, 0.923879533f, 0.382683432f, -0.382683432f,
          -0.923879533f, -0.923879533f, -0.382683433f},
         {0.187336177f, 0.370917035f, 0.521198727f, 0.649730583f, 0.760164567f,
@@ -55,12 +58,13 @@ __device__ __forceinline__ float tq_sin_centroid(int level, int code) {
          0.739639013f, 0.763736045f, 0.795010953f},
         {0.637000147f, 0.663969122f, 0.683120596f, 0.699413425f, 0.714717330f,
          0.730305588f, 0.747759992f, 0.770863679f},
-    };
-    return table[level - 1][code];
+};
+
+__device__ __forceinline__ float tq_sin_centroid(int level, int code) {
+    return kTqSinCentroid[level - 1][code];
 }
 
-__device__ __forceinline__ float tq_cos_centroid(int level, int code) {
-    constexpr float table[8][8] = {
+static __device__ __constant__ float kTqCosCentroid[8][8] = {
         {0.923879532f, 0.382683432f, -0.382683432f, -0.923879533f, -0.923879533f,
          -0.382683432f, 0.382683432f, 0.923879532f},
         {0.982295860f, 0.928666007f, 0.853435344f, 0.760164567f, 0.649730583f,
@@ -77,8 +81,10 @@ __device__ __forceinline__ float tq_cos_centroid(int level, int code) {
          0.673003812f, 0.645528662f, 0.606595075f},
         {0.770863679f, 0.747759992f, 0.730305588f, 0.714717330f, 0.699413424f,
          0.683120596f, 0.663969122f, 0.637000147f},
-    };
-    return table[level - 1][code];
+};
+
+__device__ __forceinline__ float tq_cos_centroid(int level, int code) {
+    return kTqCosCentroid[level - 1][code];
 }
 
 __device__ __forceinline__ int tq_angle_offset(int level) {
@@ -191,11 +197,21 @@ __device__ __forceinline__ float tq_decode_coordinate(const std::uint8_t* row, i
     return radius * ((d & 1) ? tq_sin_centroid(1, leaf) : tq_cos_centroid(1, leaf));
 }
 
+__device__ __forceinline__ void tq_decode_children(const std::uint8_t* row, int level, int node,
+                                                    float parent, float& left, float& right) {
+    const int code = tq_get_code(row, tq_angle_offset(level) + node);
+    left           = parent * tq_cos_centroid(level, code);
+    right          = parent * tq_sin_centroid(level, code);
+}
+
 // Decode one aligned 16-coordinate Polar subtree while sharing its root-to-level-5 prefix.
-// Every coordinate keeps the same level-8..1 multiplication order as tq_decode_coordinate;
-// only the common prefix is evaluated once (34 multiplies instead of 16 * 8 = 128).
-__device__ __forceinline__ void tq_decode_block16(const std::uint8_t* row, int d_base,
-                                                  float (&values)[16]) {
+// The old float[16] result was dynamically indexed while building the tree.  ptxas consequently
+// placed it on the per-thread stack, turning every cached row into hundreds of bytes of local
+// memory traffic.  Keep every node as a named scalar and store the leaves directly into the MMA
+// tile.  This preserves the exact level-8..1 multiplication order without a local array.
+template <bool Swizzled>
+__device__ __forceinline__ void tq_decode_block16_store(const std::uint8_t* row, int d_base,
+                                                        __nv_bfloat16* dst, int swizzle_row = 0) {
     float prefix = __half2float(*reinterpret_cast<const __half*>(row + tq::kRadiusOffset));
 #pragma unroll
     for (int level = 8; level >= 5; --level) {
@@ -203,22 +219,40 @@ __device__ __forceinline__ void tq_decode_block16(const std::uint8_t* row, int d
         prefix *= ((d_base >> (level - 1)) & 1) ? tq_sin_centroid(level, code)
                                                 : tq_cos_centroid(level, code);
     }
-    values[0] = prefix;
-    int count = 1;
-#pragma unroll
-    for (int level = 4; level >= 1; --level) {
-#pragma unroll
-        for (int node = 7; node >= 0; --node) {
-            if (node < count) {
-                const float parent = values[node];
-                const int code = tq_get_code(
-                    row, tq_angle_offset(level) + ((d_base + (node << level)) >> level));
-                values[2 * node] = parent * tq_cos_centroid(level, code);
-                values[2 * node + 1] = parent * tq_sin_centroid(level, code);
-            }
-        }
-        count <<= 1;
-    }
+
+    float l4_0, l4_1;
+    tq_decode_children(row, 4, d_base >> 4, prefix, l4_0, l4_1);
+    float l3_0, l3_1, l3_2, l3_3;
+    tq_decode_children(row, 3, d_base >> 3, l4_0, l3_0, l3_1);
+    tq_decode_children(row, 3, (d_base >> 3) + 1, l4_1, l3_2, l3_3);
+    float l2_0, l2_1, l2_2, l2_3, l2_4, l2_5, l2_6, l2_7;
+    tq_decode_children(row, 2, d_base >> 2, l3_0, l2_0, l2_1);
+    tq_decode_children(row, 2, (d_base >> 2) + 1, l3_1, l2_2, l2_3);
+    tq_decode_children(row, 2, (d_base >> 2) + 2, l3_2, l2_4, l2_5);
+    tq_decode_children(row, 2, (d_base >> 2) + 3, l3_3, l2_6, l2_7);
+    float v0, v1, v2, v3, v4, v5, v6, v7;
+    float v8, v9, v10, v11, v12, v13, v14, v15;
+    tq_decode_children(row, 1, d_base >> 1, l2_0, v0, v1);
+    tq_decode_children(row, 1, (d_base >> 1) + 1, l2_1, v2, v3);
+    tq_decode_children(row, 1, (d_base >> 1) + 2, l2_2, v4, v5);
+    tq_decode_children(row, 1, (d_base >> 1) + 3, l2_3, v6, v7);
+    tq_decode_children(row, 1, (d_base >> 1) + 4, l2_4, v8, v9);
+    tq_decode_children(row, 1, (d_base >> 1) + 5, l2_5, v10, v11);
+    tq_decode_children(row, 1, (d_base >> 1) + 6, l2_6, v12, v13);
+    tq_decode_children(row, 1, (d_base >> 1) + 7, l2_7, v14, v15);
+
+    const int offset0 = Swizzled ? gqa_prefill_swz(swizzle_row, d_base) : d_base;
+    const int offset1 = Swizzled ? gqa_prefill_swz(swizzle_row, d_base + 8) : d_base + 8;
+    const int4 lo = make_int4(static_cast<int>(pack_bf16x2(v0, v1)),
+                              static_cast<int>(pack_bf16x2(v2, v3)),
+                              static_cast<int>(pack_bf16x2(v4, v5)),
+                              static_cast<int>(pack_bf16x2(v6, v7)));
+    const int4 hi = make_int4(static_cast<int>(pack_bf16x2(v8, v9)),
+                              static_cast<int>(pack_bf16x2(v10, v11)),
+                              static_cast<int>(pack_bf16x2(v12, v13)),
+                              static_cast<int>(pack_bf16x2(v14, v15)));
+    store_vec(dst + offset0, lo);
+    store_vec(dst + offset1, hi);
 }
 
 template <bool Key>
@@ -580,10 +614,63 @@ __device__ __forceinline__ void tq_warp_qjl_query(float (&x)[8], int lane) {
     }
 }
 
+// Reconstruct the QJL residual once per cached key instead of applying a second QK matrix
+// multiplication for every query row.  Encoding stores s = sign(H D r), and the estimator is
+// r_hat = D H s * ||r|| * c/m.  A warp owns all 256 coordinates of one row (eight per lane), so
+// the Hadamard stays in registers and the reconstructed residual is folded into the transient
+// Polar key tile.  This is algebraically the same estimator used by tq_warp_qjl_query, but moves
+// work from O(queries * keys * D) to O(keys * D log D).
+template <bool Swizzled>
+__device__ __forceinline__ void tq_warp_add_qjl_residual(const std::uint8_t* row,
+                                                         __nv_bfloat16* dst, int swizzle_row,
+                                                         int lane) {
+    constexpr unsigned kQjlSeed = 0x514a4c31U;
+    constexpr float kQjlFactor  = 0.00489575835f;
+    float x[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int d = lane + 32 * i;
+        const unsigned bit =
+            (row[tq::kQjlSignsOffset + (d >> 3)] >> (d & 7)) & 1U;
+        x[i] = bit ? 1.0f : -1.0f;
+    }
+#pragma unroll
+    for (int stride = 1; stride < 32; stride <<= 1) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float self = x[i];
+            const float partner = __shfl_xor_sync(0xffffffffU, self, stride);
+            x[i] = (lane & stride) ? partner - self : self + partner;
+        }
+    }
+#pragma unroll
+    for (int mask = 1; mask < 8; mask <<= 1) {
+        float old[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { old[i] = x[i]; }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            x[i] = (i & mask) ? old[i ^ mask] - old[i] : old[i] + old[i ^ mask];
+        }
+    }
+    const float gamma =
+        __half2float(*reinterpret_cast<const __half*>(row + tq::kQjlNormOffset));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int d = lane + 32 * i;
+        const int index = Swizzled ? gqa_prefill_swz(swizzle_row, d) : d;
+        const float residual =
+            x[i] * tq_random_sign(d, kQjlSeed) * gamma * kQjlFactor;
+        dst[index] = __float2bfloat16(__bfloat162float(dst[index]) + residual);
+    }
+}
+
 // Small-T fused packed consumer. One CTA owns all query positions for one KV head and split, so
-// every packed K/V row is decoded once for T=1..6. Polar and QJL score products use SM80+ BF16 MMA;
-// V aggregation stays in FP32 registers so online-softmax scaling remains exact per query row.
+// every packed K/V row is decoded once for T=1..8. The reconstructed Polar+QJL key uses one SM80+
+// BF16 MMA; V aggregation stays in FP32 registers so online-softmax scaling is exact per row.
 template <typename Geometry, int TokenTile>
+// Two resident CTAs hide constant-cache and shared-memory latency.  The centroid codebooks live
+// in device constant memory, so the 128-register sm_86 budget no longer spills them to local DRAM.
 __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
     const __nv_bfloat16* q, const std::int32_t* positions, const std::uint8_t* cache_k,
     const std::uint8_t* cache_v, const std::int32_t* block_tables,
@@ -595,7 +682,6 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
     constexpr int kMmaRows    = ((kRows + 15) / 16) * 16;
     constexpr int kPanels     = kMmaRows / 16;
     constexpr int kKeyTile    = 16;
-    constexpr float kQjlFactor  = 0.00489575835f;
 
     const int kvh    = static_cast<int>(blockIdx.x);
     const int split  = static_cast<int>(blockIdx.y);
@@ -621,7 +707,6 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
     const std::int32_t* table = block_tables + static_cast<std::int64_t>(table_row) * table_stride;
 
     __shared__ __align__(32) __nv_bfloat16 qmatrix[kMmaRows * tq::kHeadDim];
-    extern __shared__ __align__(32) __nv_bfloat16 qjlmatrix[];
     __shared__ __align__(32) __nv_bfloat16 tile[kKeyTile * tq::kHeadDim];
     __shared__ __align__(32) float scores[kMmaRows * kKeyTile];
     __shared__ int query_positions[TokenTile];
@@ -667,17 +752,11 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
                             : 0.0f;
             }
             tq_warp_polar_query(qr, lane);
-            float qjlr[8];
-#pragma unroll
-            for (int i = 0; i < 8; ++i) { qjlr[i] = qr[i]; }
-            tq_warp_qjl_query(qjlr, lane);
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const int element = lane + 32 * i;
                 qmatrix[(token * Geometry::GroupSize + warp) * tq::kHeadDim + element] =
                     __float2bfloat16(qr[i]);
-                qjlmatrix[(token * Geometry::GroupSize + warp) * tq::kHeadDim + element] =
-                    __float2bfloat16(qjlr[i]);
             }
         }
     }
@@ -704,18 +783,35 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
             const int j = d >> 4;
             const int d_base = (d & 15) * 16;
             const int key = tile_begin + j;
-            float values[16]{};
             if (key < key_end) {
                 const int physical = table[key >> kPagedKVPageShift];
                 const int page_off = key & kPagedKVPageMask;
                 const std::uint8_t* row =
                     cache_k + paged_kv_element_offset<tq::kKeyBytes, Geometry::KVHeads>(
                                   physical, kvh, page_off, 0);
-                tq_decode_block16(row, d_base, values);
-            }
+                tq_decode_block16_store<false>(row, d_base, tile + j * tq::kHeadDim);
+            } else {
 #pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                tile[j * tq::kHeadDim + d_base + i] = __float2bfloat16(values[i]);
+                for (int i = 0; i < 16; ++i) {
+                    tile[j * tq::kHeadDim + d_base + i] = __float2bfloat16(0.0f);
+                }
+            }
+        }
+        __syncthreads();
+
+        // Each warp owns the two rows that its 32 threads decoded above.  Reconstruct their QJL
+        // residuals in registers and fold them into the Polar tile before the sole QK MMA.
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            const int j = 2 * warp + pair;
+            const int key = tile_begin + j;
+            if (key < key_end) {
+                const int physical = table[key >> kPagedKVPageShift];
+                const int page_off = key & kPagedKVPageMask;
+                const std::uint8_t* row =
+                    cache_k + paged_kv_element_offset<tq::kKeyBytes, Geometry::KVHeads>(
+                                  physical, kvh, page_off, 0);
+                tq_warp_add_qjl_residual<false>(row, tile + j * tq::kHeadDim, 0, lane);
             }
         }
         __syncthreads();
@@ -732,49 +828,6 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
                 wmma::load_matrix_sync(b, tile + kk, tq::kHeadDim);
                 wmma::mma_sync(score_acc, a, b, score_acc);
             }
-        }
-        __syncthreads();
-
-        // dot(H D q, sign(H D r)) == q dot(D H sign(H D r)). The dual query was
-        // transformed once above; stage the packed signs directly for the second MMA.
-        {
-            const int j = d >> 4;
-            const int d_base = (d & 15) * 16;
-            const int key = tile_begin + j;
-            const std::uint8_t* row = nullptr;
-            float gamma_factor = 0.0f;
-            if (key < key_end) {
-                const int physical = table[key >> kPagedKVPageShift];
-                const int page_off = key & kPagedKVPageMask;
-                row = cache_k + paged_kv_element_offset<tq::kKeyBytes, Geometry::KVHeads>(
-                                    physical, kvh, page_off, 0);
-                const float gamma =
-                    __half2float(*reinterpret_cast<const __half*>(row + tq::kQjlNormOffset));
-                gamma_factor = gamma * kQjlFactor;
-            }
-#pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                const int element = d_base + i;
-                const unsigned bit = row == nullptr
-                                         ? 0U
-                                         : (row[tq::kQjlSignsOffset + (element >> 3)] >>
-                                            (element & 7)) &
-                                               1U;
-                tile[j * tq::kHeadDim + element] = __float2bfloat16(
-                    row == nullptr ? 0.0f : (bit ? gamma_factor : -gamma_factor));
-            }
-        }
-        __syncthreads();
-        if (warp < kPanels) {
-#pragma unroll
-            for (int kk = 0; kk < tq::kHeadDim; kk += 16) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
-                wmma::load_matrix_sync(a, qjlmatrix + warp * 16 * tq::kHeadDim + kk,
-                                       tq::kHeadDim);
-                wmma::load_matrix_sync(b, tile + kk, tq::kHeadDim);
-                wmma::mma_sync(score_acc, a, b, score_acc);
-            }
             wmma::store_matrix_sync(scores + warp * 16 * kKeyTile, score_acc, kKeyTile,
                                     wmma::mem_row_major);
         }
@@ -785,18 +838,18 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
             const int j = d >> 4;
             const int d_base = (d & 15) * 16;
             const int key = tile_begin + j;
-            float values[16]{};
             if (key < key_end) {
                 const int physical = table[key >> kPagedKVPageShift];
                 const int page_off = key & kPagedKVPageMask;
                 const std::uint8_t* row =
                     cache_v + paged_kv_element_offset<tq::kValueBytes, Geometry::KVHeads>(
                                   physical, kvh, page_off, 0);
-                tq_decode_block16(row, d_base, values);
-            }
+                tq_decode_block16_store<false>(row, d_base, tile + j * tq::kHeadDim);
+            } else {
 #pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                tile[j * tq::kHeadDim + d_base + i] = __float2bfloat16(values[i]);
+                for (int i = 0; i < 16; ++i) {
+                    tile[j * tq::kHeadDim + d_base + i] = __float2bfloat16(0.0f);
+                }
             }
         }
         __syncthreads();

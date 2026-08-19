@@ -21,9 +21,15 @@ inline constexpr int kGqaPrefillHeadDim = 256;
 inline constexpr int kGqaPrefillBr        = 64;
 inline constexpr int kGqaPrefillBc        = 64;
 inline constexpr int kGqaPrefillThreads   = 128;
+inline constexpr int kGqaPrefillTqBr      = 128;
+inline constexpr int kGqaPrefillTqThreads = 256;
 inline constexpr int kGqaPrefillSmemBytes = (kGqaPrefillBr + 2 * kGqaPrefillBc) *
                                             kGqaPrefillHeadDim *
                                             static_cast<int>(sizeof(__nv_bfloat16));
+static_assert((kGqaPrefillTqBr + kGqaPrefillBc) * kGqaPrefillHeadDim *
+                      static_cast<int>(sizeof(__nv_bfloat16)) ==
+                  kGqaPrefillSmemBytes,
+              "TurboQuant Br=128 must retain the 96 KiB shared-memory envelope");
 
 struct GqaPrefillDirectMetadata {
     const std::int32_t* table;
