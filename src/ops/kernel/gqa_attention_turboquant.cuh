@@ -87,6 +87,43 @@ __device__ __forceinline__ float tq_cos_centroid(int level, int code) {
     return kTqCosCentroid[level - 1][code];
 }
 
+// The block decoder needs both children at levels 1..4. Keep each exact pair adjacent so one
+// 64-bit constant load replaces separate, divergent sin and cos transactions.
+static __device__ __constant__ float2 kTqChildCentroid[4][8] = {
+    {{0.923879532f, 0.382683433f},
+     {0.382683432f, 0.923879532f},
+     {-0.382683432f, 0.923879533f},
+     {-0.923879533f, 0.382683432f},
+     {-0.923879533f, -0.382683432f},
+     {-0.382683432f, -0.923879533f},
+     {0.382683432f, -0.923879533f},
+     {0.923879532f, -0.382683433f}},
+    {{0.982295860f, 0.187336177f},
+     {0.928666007f, 0.370917035f},
+     {0.853435344f, 0.521198727f},
+     {0.760164567f, 0.649730583f},
+     {0.649730583f, 0.760164567f},
+     {0.521198727f, 0.853435344f},
+     {0.370917035f, 0.928666007f},
+     {0.187336177f, 0.982295860f}},
+    {{0.953088222f, 0.302692652f},
+     {0.890125635f, 0.455715211f},
+     {0.821894218f, 0.569640145f},
+     {0.747340082f, 0.664441721f},
+     {0.664441721f, 0.747340083f},
+     {0.569640145f, 0.821894218f},
+     {0.455715211f, 0.890125635f},
+     {0.302692652f, 0.953088222f}},
+    {{0.910724577f, 0.413014220f},
+     {0.849557579f, 0.527495896f},
+     {0.793171536f, 0.608998288f},
+     {0.736530154f, 0.676404710f},
+     {0.676404711f, 0.736530154f},
+     {0.608998288f, 0.793171536f},
+     {0.527495896f, 0.849557579f},
+     {0.413014220f, 0.910724576f}},
+};
+
 __device__ __forceinline__ int tq_angle_offset(int level) {
     return level == 1 ? 0 : 256 - (256 >> (level - 1));
 }
@@ -200,8 +237,9 @@ __device__ __forceinline__ float tq_decode_coordinate(const std::uint8_t* row, i
 __device__ __forceinline__ void tq_decode_children(const std::uint8_t* row, int level, int node,
                                                     float parent, float& left, float& right) {
     const int code = tq_get_code(row, tq_angle_offset(level) + node);
-    left           = parent * tq_cos_centroid(level, code);
-    right          = parent * tq_sin_centroid(level, code);
+    const float2 children = kTqChildCentroid[level - 1][code];
+    left                  = parent * children.x;
+    right                 = parent * children.y;
 }
 
 // Decode one aligned 16-coordinate Polar subtree while sharing its root-to-level-5 prefix.
