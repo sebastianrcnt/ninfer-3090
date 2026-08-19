@@ -372,6 +372,45 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     const std::string label =
         std::string("gdn_norm_gating_proj ") + geometry.label + " T=" + std::to_string(tokens);
     int failures = 0;
+    if (tokens > 1 && tokens <= 8) {
+        GuardedDeviceBuffer sequential_h(h_elements * sizeof(std::uint16_t));
+        GuardedDeviceBuffer sequential_g(control_elements * sizeof(float));
+        GuardedDeviceBuffer sequential_beta(control_elements * sizeof(float));
+        Tensor sequential_h_view(sequential_h.data(), DType::BF16, {geometry.hidden, tokens});
+        Tensor sequential_g_view(sequential_g.data(), DType::FP32, {geometry.heads, tokens});
+        Tensor sequential_beta_view(sequential_beta.data(), DType::FP32,
+                                    {geometry.heads, tokens});
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            Tensor x_one = tensor_x.slice(1, token, 1);
+            Tensor h_one = sequential_h_view.slice(1, token, 1);
+            Tensor g_one = sequential_g_view.slice(1, token, 1);
+            Tensor beta_one = sequential_beta_view.slice(1, token, 1);
+            workspace.reset();
+            if (geometry.parent_weight) {
+                Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
+                ops::gdn_norm_gating_proj(x_one, tensor_norm_weight, kEps, parent, tensor_a_log,
+                                          tensor_dt_bias, workspace, h_one, g_one, beta_one,
+                                          nullptr);
+            } else {
+                Weight weight_a = bf16_weight(device_weight.p, geometry.heads, geometry.hidden);
+                Weight weight_b =
+                    bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
+                ops::gdn_norm_gating_proj(x_one, tensor_norm_weight, kEps, weight_a, weight_b,
+                                          tensor_a_log, tensor_dt_bias, workspace, h_one, g_one,
+                                          beta_one, nullptr);
+            }
+        }
+        cuda_synchronize();
+        if (from_device<std::uint16_t>(device_h.data(), h_elements) !=
+                from_device<std::uint16_t>(sequential_h.data(), h_elements) ||
+            from_device<float>(device_g.data(), control_elements) !=
+                from_device<float>(sequential_g.data(), control_elements) ||
+            from_device<float>(device_beta.data(), control_elements) !=
+                from_device<float>(sequential_beta.data(), control_elements)) {
+            std::cerr << label << ": differs from sequential T=1 output\n";
+            ++failures;
+        }
+    }
     failures += verify_normwise(label + " h", from_device_bf16(device_h.data(), h_elements),
                                 reference_h, kGdnNormOutputBf16);
     failures += verify_normwise(label + " g", read_fp32(device_g.data(), control_elements),
@@ -454,6 +493,7 @@ int main() {
 
     // 27B uses the composed implementation; 35B also qualifies both sides of its fused boundary.
     failures += run_norm_projection_case(kQwen27, 1, 0x3001u);
+    failures += run_norm_projection_case(kQwen27, 2, 0x3002u);
     failures += run_norm_projection_case(kQwen27, 9, 0x3009u);
     failures += run_norm_projection_case(kQwen27, 64, 0x3040u);
     failures += run_norm_projection_case(kQwen35, 1, 0x4001u);

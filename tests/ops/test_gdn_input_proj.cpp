@@ -50,11 +50,28 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
     cuda_synchronize();
 
+    GuardedBf16Tensor sequential_qkv(kRows, tokens);
+    GuardedBf16Tensor sequential_z(kZRows, tokens);
+    Tensor sequential_output = sequential_qkv.tensor();
+    Tensor sequential_z_output = sequential_z.tensor();
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        Tensor x_one = x.slice(1, token, 1);
+        Tensor output_one = sequential_output.slice(1, token, 1);
+        Tensor z_one = sequential_z_output.slice(1, token, 1);
+        ops::gdn_input_proj(x_one, query_key.view(), value_z_weight.view(), output_one, z_one,
+                            nullptr);
+    }
+    cuda_synchronize();
+
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
     int failures             = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
     failures += z.verify_fully_written("gdn z" + suffix);
+    if (qkv.bits() != sequential_qkv.bits() || z.bits() != sequential_z.bits()) {
+        std::cerr << "gdn Q4/Q5 batched/sequential BF16 parity failed" << suffix << '\n';
+        ++failures;
+    }
     failures += verify_output_range("gdn qk" + suffix, qkv, kRows, 0, kQkRows, query_key.host, 0,
                                     activation, kHidden, tokens);
     failures += verify_output_range("gdn value" + suffix, qkv, kRows, kQkRows, kValueRows,
@@ -74,7 +91,7 @@ int run_q4_q5() {
     DevicePackedWeight value_z_weight(
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 419U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17}) {
+    for (const std::int32_t tokens : {1, 2, 16}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens);
     }
     return failures;

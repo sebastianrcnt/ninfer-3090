@@ -222,5 +222,177 @@ q5_rowsplit_gemv_residual_launch_kernel(const __nv_bfloat16* x, const std::uint8
         <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, residual_out, nullptr);
 }
 
+// Small-T residual projection with the exact arithmetic contract of the T=1 GEMV. Each warp
+// keeps one accumulator per token while streaming its weight tile only once. Interleaving tokens
+// does not change the per-token FMA or warp-reduction order, so speculative Verify is bitwise
+// identical to repeated ordinary decode without re-reading the weight matrix for every token.
+template <int kN, int kK, int kRowsPerBlock, int kStages, int kTokens>
+__global__ void q5_rowsplit_gemv_small_t_exact_residual_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ high_bits, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ out) {
+    constexpr int kGroupK              = 64;
+    constexpr int kGroups              = kK / kGroupK;
+    constexpr int kGroupsPerTile       = 16;
+    constexpr int kTiles               = kGroups / kGroupsPerTile;
+    constexpr int kNibbleBytesPerGroup = 32;
+    constexpr int kHighBytesPerGroup   = 8;
+    constexpr int kPrefetch            = kStages - 1;
+    static_assert(kGroups % kGroupsPerTile == 0);
+    static_assert(kN % kRowsPerBlock == 0);
+    static_assert(kStages >= 2);
+    static_assert(kTokens >= 2 && kTokens <= 8);
+
+    __shared__ uint4 s_nib[kRowsPerBlock][kStages][32];
+    __shared__ uint4 s_hi[kRowsPerBlock][kStages][8];
+    __shared__ uint4 s_sc[kRowsPerBlock][kStages][2];
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int row  = static_cast<int>(blockIdx.x) * kRowsPerBlock + warp;
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(row) * kGroups * kNibbleBytesPerGroup;
+    const std::uint8_t* high_row =
+        high_bits + static_cast<std::int64_t>(row) * kGroups * kHighBytesPerGroup;
+    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
+
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+        if (p < kTiles) {
+            q5_gemv_issue_tile(s_nib[warp][p], s_hi[warp][p], s_sc[warp][p], code_row, high_row,
+                               scale_row, p, lane);
+        } else {
+            pipe_commit();
+        }
+    }
+
+    float acc[kTokens] = {};
+#pragma unroll 1
+    for (int tile = 0; tile < kTiles; ++tile) {
+        const int fetch = tile + kPrefetch;
+        if (fetch < kTiles) {
+            const int buf = fetch % kStages;
+            q5_gemv_issue_tile(s_nib[warp][buf], s_hi[warp][buf], s_sc[warp][buf], code_row,
+                               high_row, scale_row, fetch, lane);
+        } else {
+            pipe_commit();
+        }
+        pipe_wait<kPrefetch>();
+        __syncwarp();
+        const int buf = tile % kStages;
+#pragma unroll
+        for (int token = 0; token < kTokens; ++token) {
+            const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(
+                x + static_cast<std::int64_t>(token) * kK);
+            acc[token] = q5_gemv_consume_tile(x2, s_nib[warp][buf], s_hi[warp][buf],
+                                              s_sc[warp][buf], tile, lane, acc[token]);
+        }
+        __syncwarp();
+    }
+
+#pragma unroll
+    for (int token = 0; token < kTokens; ++token) {
+        const float sum = warp_reduce_sum(acc[token]);
+        if (lane == 0) {
+            const std::int64_t index = static_cast<std::int64_t>(token) * kN + row;
+            out[index] = __float2bfloat16_rn(__bfloat162float(out[index]) + sum);
+        }
+    }
+}
+
+template <int kN, int kK, int kRowsPerBlock, int kStages, int kTokens>
+inline void q5_rowsplit_gemv_small_t_exact_residual_launch_kernel(
+    const __nv_bfloat16* x, const std::uint8_t* codes, const std::uint8_t* high_bits,
+    const std::uint8_t* scales, __nv_bfloat16* residual_out, cudaStream_t stream) {
+    constexpr int kBlockThreads = kRowsPerBlock * 32;
+    constexpr int kGrid         = kN / kRowsPerBlock;
+    q5_rowsplit_gemv_small_t_exact_residual_kernel<kN, kK, kRowsPerBlock, kStages, kTokens>
+        <<<kGrid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, residual_out);
+}
+
+// Generic small-T form of the exact T=1 Q5 GEMV contract.  It exists for fused users whose
+// epilogue consumes every token of a row at once (notably projection -> causal-convolution).
+// The weight tile is staged once, while each token retains the T=1 FMA and warp-reduction order.
+template <int kN, int kK, int kRowsPerBlock, int kStages, int kTokens, class Epilogue,
+          bool TriggerPdl = false, bool JoinPdl = false>
+__global__ void q5_rowsplit_gemv_small_t_exact_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ high_bits, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ out_tail,
+    Epilogue epilogue = {}) {
+    constexpr int kGroupK              = 64;
+    constexpr int kGroups              = kK / kGroupK;
+    constexpr int kGroupsPerTile       = 16;
+    constexpr int kTiles               = kGroups / kGroupsPerTile;
+    constexpr int kNibbleBytesPerGroup = 32;
+    constexpr int kHighBytesPerGroup   = 8;
+    constexpr int kPrefetch            = kStages - 1;
+    static_assert(kGroups % kGroupsPerTile == 0);
+    static_assert(kN % kRowsPerBlock == 0);
+    static_assert(kStages >= 2);
+    static_assert(kTokens >= 2 && kTokens <= 8);
+
+    if constexpr (TriggerPdl) {
+        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
+    }
+
+    __shared__ uint4 s_nib[kRowsPerBlock][kStages][32];
+    __shared__ uint4 s_hi[kRowsPerBlock][kStages][8];
+    __shared__ uint4 s_sc[kRowsPerBlock][kStages][2];
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int row  = static_cast<int>(blockIdx.x) * kRowsPerBlock + warp;
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(row) * kGroups * kNibbleBytesPerGroup;
+    const std::uint8_t* high_row =
+        high_bits + static_cast<std::int64_t>(row) * kGroups * kHighBytesPerGroup;
+    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
+
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+        if (p < kTiles) {
+            q5_gemv_issue_tile(s_nib[warp][p], s_hi[warp][p], s_sc[warp][p], code_row, high_row,
+                               scale_row, p, lane);
+        } else {
+            pipe_commit();
+        }
+    }
+
+    float acc[kTokens] = {};
+#pragma unroll 1
+    for (int tile = 0; tile < kTiles; ++tile) {
+        const int fetch = tile + kPrefetch;
+        if (fetch < kTiles) {
+            const int buf = fetch % kStages;
+            q5_gemv_issue_tile(s_nib[warp][buf], s_hi[warp][buf], s_sc[warp][buf], code_row,
+                               high_row, scale_row, fetch, lane);
+        } else {
+            pipe_commit();
+        }
+        pipe_wait<kPrefetch>();
+        __syncwarp();
+        const int buf = tile % kStages;
+#pragma unroll
+        for (int token = 0; token < kTokens; ++token) {
+            const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(
+                x + static_cast<std::int64_t>(token) * kK);
+            acc[token] = q5_gemv_consume_tile(x2, s_nib[warp][buf], s_hi[warp][buf],
+                                              s_sc[warp][buf], tile, lane, acc[token]);
+        }
+        __syncwarp();
+    }
+
+    float sums[kTokens];
+#pragma unroll
+    for (int token = 0; token < kTokens; ++token) {
+        sums[token] = warp_reduce_sum(acc[token]);
+    }
+    if (lane == 0) {
+        epilogue.template operator()<false, 0, kTokens>(out, out_tail, 0, 0, row, sums);
+    }
+    if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
+}
+
 
 } // namespace ninfer::ops::detail

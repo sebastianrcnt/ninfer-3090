@@ -63,6 +63,27 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, nullptr);
     cuda_synchronize();
 
+    GuardedBf16Tensor sequential_query(kQRows, tokens);
+    GuardedBf16Tensor sequential_gate(kQRows, tokens);
+    GuardedBf16Tensor sequential_key(kKvRows, tokens);
+    GuardedBf16Tensor sequential_value(kKvRows, tokens);
+    if (tokens > 1 && tokens <= 8) {
+        Tensor sq = sequential_query.tensor();
+        Tensor sg = sequential_gate.tensor();
+        Tensor sk = sequential_key.tensor();
+        Tensor sv = sequential_value.tensor();
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            Tensor x_one = x.slice(1, token, 1);
+            Tensor q_one = sq.slice(1, token, 1);
+            Tensor g_one = sg.slice(1, token, 1);
+            Tensor k_one = sk.slice(1, token, 1);
+            Tensor v_one = sv.slice(1, token, 1);
+            ops::attn_input_proj(x_one, query_key.view(), gate_value.view(), q_one, g_one, k_one,
+                                 v_one, nullptr);
+        }
+        cuda_synchronize();
+    }
+
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
     int failures             = 0;
     failures += verify_output("attn q" + suffix, query, query_key.host, 0, kQRows, activation,
@@ -74,6 +95,12 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     failures += verify_output("attn value" + suffix, value, gate_value.host, kQRows, kKvRows,
                               activation, kHidden, tokens);
     failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
+    if (tokens > 1 && tokens <= 8 &&
+        (query.bits() != sequential_query.bits() || gate.bits() != sequential_gate.bits() ||
+         key.bits() != sequential_key.bits() || value.bits() != sequential_value.bits())) {
+        std::cerr << "attn Q4/Q5 batched/sequential BF16 parity failed" << suffix << '\n';
+        ++failures;
+    }
     failures += query_key.verify_preserved("attn query/key" + suffix);
     failures += gate_value.verify_preserved("attn gate/value" + suffix);
     return failures;

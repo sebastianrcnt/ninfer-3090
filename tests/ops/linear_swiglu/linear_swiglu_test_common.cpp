@@ -303,6 +303,33 @@ int run_profile(std::string_view label, const Profile& profile,
         const std::vector<double> actual = read_bf16_output(output, output_elements);
         failures +=
             compare_output(case_label, actual, reference.data(), profile.activation_compute);
+        if (tokens > 1 && tokens <= 8 && profile.activation_compute == ActivationCompute::A16) {
+            test::GuardedDeviceBuffer sequential(output_elements * sizeof(std::uint16_t));
+            sequential.fill(0xff);
+            Tensor sequential_destination(sequential.data(), DType::BF16,
+                                          {profile.output_rows, tokens});
+            for (std::int32_t token = 0; token < tokens; ++token) {
+                Tensor x_one = x.slice(1, token, 1);
+                Tensor out_one = sequential_destination.slice(1, token, 1);
+                workspace.reset();
+                ops::linear_swiglu(x_one, weight, out_one, policy, workspace, nullptr);
+            }
+            test::cuda_check(cudaDeviceSynchronize(),
+                             "synchronize sequential LinearSwiGLU parity");
+            std::vector<std::uint16_t> wide_bits(output_elements);
+            std::vector<std::uint16_t> sequential_bits(output_elements);
+            cuda_check(cudaMemcpy(wide_bits.data(), output.data(), output.bytes(),
+                                  cudaMemcpyDeviceToHost),
+                       "copy wide LinearSwiGLU parity output");
+            cuda_check(cudaMemcpy(sequential_bits.data(), sequential.data(), sequential.bytes(),
+                                  cudaMemcpyDeviceToHost),
+                       "copy sequential LinearSwiGLU parity output");
+            if (wide_bits != sequential_bits) {
+                std::cerr << case_label << ": differs from sequential T=1 BF16 output\n";
+                ++failures;
+            }
+            failures += sequential.verify_guards(case_label + " sequential");
+        }
     }
     failures += device_activation.verify_guards(std::string(label) + " activation");
     failures += device_weight.verify_guards(std::string(label) + " weight");

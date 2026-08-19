@@ -96,7 +96,11 @@ struct GdnConvEpilogue {
                 continue;
             }
 
-            const float p              = projected[token];
+            // The ordinary decode path materializes the projection as BF16 before the causal
+            // convolution consumes it.  Replay/verify must preserve that same boundary even
+            // when projection and convolution share an epilogue; otherwise a wider Verify
+            // round retains extra FP32 bits and can change target logits after several rounds.
+            const float p = __bfloat162float(__float2bfloat16_rn(projected[token]));
             float conv                 = fmaf(w0, s0, 0.0F);
             conv                       = fmaf(w1, s1, conv);
             conv                       = fmaf(w2, s2, conv);

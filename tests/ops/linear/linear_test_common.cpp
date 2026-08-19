@@ -335,6 +335,46 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                 ops::linear(input, weight, destination, invocation.policy, workspace, nullptr);
             }
             cuda_check(cudaDeviceSynchronize(), "synchronize linear");
+
+            // DFlash verification must make exactly the same token decision as repeated decode.
+            // The target LM head has a dedicated T=2..8 path, so guard its bitwise contract here.
+            if (activation_compute == ActivationCompute::A16 &&
+                weight.qtype == QType::Q4G64_F16S && shape.n == 131072 && shape.k == 5120 &&
+                invocation.t >= 2 && invocation.t <= 8) {
+                GuardedOutput sequential(
+                    checked_elements(shape.n, invocation.t, "sequential guarded output"));
+                for (std::int32_t token = 0; token < invocation.t; ++token) {
+                    Tensor token_input(
+                        static_cast<std::uint8_t*>(device_activation.p) +
+                            static_cast<std::size_t>(token) * shape.k * sizeof(std::uint16_t),
+                        DType::BF16, {shape.k, 1});
+                    Tensor token_destination(
+                        static_cast<std::uint8_t*>(sequential.data()) +
+                            static_cast<std::size_t>(token) * shape.n * sizeof(std::uint16_t),
+                        DType::BF16, {shape.n, 1});
+                    ops::linear(token_input, weight, token_destination, nullptr);
+                }
+                cuda_check(cudaDeviceSynchronize(), "synchronize sequential linear");
+                const std::size_t words = checked_elements(shape.n, invocation.t,
+                                                           "sequential comparison");
+                std::vector<std::uint16_t> wide(words);
+                std::vector<std::uint16_t> narrow(words);
+                cuda_check(cudaMemcpy(wide.data(), output.data(), words * sizeof(std::uint16_t),
+                                      cudaMemcpyDeviceToHost),
+                           "copy wide linear output");
+                cuda_check(cudaMemcpy(narrow.data(), sequential.data(),
+                                      words * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                           "copy sequential linear output");
+                if (wide != narrow) {
+                    const auto mismatch = std::mismatch(wide.begin(), wide.end(), narrow.begin());
+                    std::cerr << case_label << ": wide/sequential bit mismatch at "
+                              << std::distance(wide.begin(), mismatch.first) << " wide=0x"
+                              << std::hex << *mismatch.first << " sequential=0x"
+                              << *mismatch.second << std::dec << '\n';
+                    ++failures;
+                }
+                failures += sequential.verify_guards(case_label + " sequential");
+            }
         } catch (const std::exception& error) {
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
             ++failures;

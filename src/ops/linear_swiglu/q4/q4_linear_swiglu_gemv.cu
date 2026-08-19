@@ -103,7 +103,8 @@ struct Q4SwiGluSmallTEpilogue {
 using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <int ActiveCols>
-void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+void launch_small_t_mma_active(const Tensor& x, const Weight& w, Tensor& out,
+                               cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
     using Schedule =
@@ -124,7 +125,7 @@ void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaSt
 template <std::size_t... Offsets>
 constexpr auto make_small_t_launchers(std::index_sequence<Offsets...>) {
     return std::array<SmallTLauncher, sizeof...(Offsets)>{
-        &launch_small_t_active<2 + static_cast<int>(Offsets)>...};
+        &launch_small_t_mma_active<2 + static_cast<int>(Offsets)>...};
 }
 
 constexpr auto kSmallTLaunchers = make_small_t_launchers(std::make_index_sequence<31>{});
@@ -149,6 +150,129 @@ __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[
     }
     pipe_commit();
 }
+
+// Small-T SwiGLU with the exact arithmetic contract of the T=1 GEMV.  A warp owns one
+// gate/up row pair and keeps one accumulator pair per token while streaming each weight tile
+// only once.  Interleaving tokens leaves both the per-token FMA sequence and warp reduction
+// order unchanged, so Verify is bitwise identical to repeated ordinary decode without
+// re-reading the 52.4 MiB gate/up matrix for every speculative position.
+template <int ActiveCols>
+__global__ void q4_linear_swiglu_small_t_exact_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
+    constexpr int kStages   = 3;
+    constexpr int kPrefetch = kStages - 1;
+    static_assert(ActiveCols >= 2 && ActiveCols <= 8);
+
+    __shared__ uint4 code_tile[kWarpsPerBlock][kStages][2][kVecsPerWarpTile];
+    __shared__ uint4 scale_tile[kWarpsPerBlock][kStages][2][2];
+
+    const int lane    = static_cast<int>(threadIdx.x) & 31;
+    const int warp    = static_cast<int>(threadIdx.x) >> 5;
+    const int out_row = static_cast<int>(blockIdx.x) * kPairsPerBlock + warp;
+
+    const std::uint8_t* gate_code_row =
+        codes + static_cast<std::int64_t>(out_row) * kGroups * kBytesPerGroup;
+    const std::uint8_t* gate_scale_row =
+        scales + static_cast<std::int64_t>(out_row) * kGroups * 2;
+    const std::uint8_t* up_code_row =
+        codes + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * kBytesPerGroup;
+    const std::uint8_t* up_scale_row =
+        scales + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * 2;
+
+    float gate_acc[ActiveCols] = {};
+    float up_acc[ActiveCols]   = {};
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+        if (p < kTiles) {
+            q4_issue_pair_tile(code_tile[warp][p], scale_tile[warp][p], gate_code_row,
+                               gate_scale_row, up_code_row, up_scale_row, p, lane);
+        } else {
+            pipe_commit();
+        }
+    }
+
+#pragma unroll 1
+    for (int tile = 0; tile < kTiles; ++tile) {
+        const int fetch = tile + kPrefetch;
+        if (fetch < kTiles) {
+            const int buf = fetch % kStages;
+            q4_issue_pair_tile(code_tile[warp][buf], scale_tile[warp][buf], gate_code_row,
+                               gate_scale_row, up_code_row, up_scale_row, fetch, lane);
+        } else {
+            pipe_commit();
+        }
+        pipe_wait<kPrefetch>();
+        __syncwarp();
+
+        const int buf           = tile % kStages;
+        const auto* gate_codes  = reinterpret_cast<const std::uint8_t*>(code_tile[warp][buf][0]);
+        const auto* up_codes    = reinterpret_cast<const std::uint8_t*>(code_tile[warp][buf][1]);
+        const auto* gate_scales =
+            reinterpret_cast<const std::uint16_t*>(scale_tile[warp][buf][0]);
+        const auto* up_scales =
+            reinterpret_cast<const std::uint16_t*>(scale_tile[warp][buf][1]);
+#pragma unroll
+        for (int tile_group = 0; tile_group < kGroupsPerWarpTile; ++tile_group) {
+            const float gate_scale = __half2float(
+                __ushort_as_half(static_cast<std::uint16_t>(gate_scales[tile_group])));
+            const float up_scale = __half2float(
+                __ushort_as_half(static_cast<std::uint16_t>(up_scales[tile_group])));
+            const int gate_packed =
+                static_cast<int>(gate_codes[tile_group * kBytesPerGroup + lane]);
+            const int gate_q0   = sign_extend<4>(gate_packed & 0x0f);
+            const int gate_q1   = sign_extend<4>(gate_packed >> 4);
+            const int up_packed =
+                static_cast<int>(up_codes[tile_group * kBytesPerGroup + lane]);
+            const int up_q0 = sign_extend<4>(up_packed & 0x0f);
+            const int up_q1 = sign_extend<4>(up_packed >> 4);
+            const int k0 = (tile * kGroupsPerWarpTile + tile_group) * kGroupK + lane * 2;
+#pragma unroll
+            for (int token = 0; token < ActiveCols; ++token) {
+                const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(
+                    x + static_cast<std::int64_t>(token) * kK);
+                const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
+                gate_acc[token] =
+                    fmaf(static_cast<float>(gate_q0) * gate_scale, xv.x, gate_acc[token]);
+                gate_acc[token] =
+                    fmaf(static_cast<float>(gate_q1) * gate_scale, xv.y, gate_acc[token]);
+                up_acc[token] =
+                    fmaf(static_cast<float>(up_q0) * up_scale, xv.x, up_acc[token]);
+                up_acc[token] =
+                    fmaf(static_cast<float>(up_q1) * up_scale, xv.y, up_acc[token]);
+            }
+        }
+        __syncwarp();
+    }
+
+#pragma unroll
+    for (int token = 0; token < ActiveCols; ++token) {
+        const float gate_sum = warp_reduce_sum(gate_acc[token]);
+        const float up_sum   = warp_reduce_sum(up_acc[token]);
+        if (lane == 0) {
+            out[static_cast<std::int64_t>(token) * kIntermediate + out_row] =
+                __float2bfloat16(silu(gate_sum) * up_sum);
+        }
+    }
+}
+
+template <int ActiveCols>
+void launch_small_t_exact_active(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream) {
+    constexpr int kBlocks = kIntermediate / kPairsPerBlock;
+    q4_linear_swiglu_small_t_exact_kernel<ActiveCols><<<kBlocks, kBlockThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_small_t_exact_launchers(std::index_sequence<Offsets...>) {
+    return std::array<SmallTLauncher, sizeof...(Offsets)>{
+        &launch_small_t_exact_active<2 + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kSmallTExactLaunchers = make_small_t_exact_launchers(std::make_index_sequence<7>{});
 
 __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restrict__ x,
                                                   const std::uint8_t* __restrict__ codes,
@@ -258,7 +382,11 @@ void q4_linear_swiglu_small_t_exact_launch(const Tensor& x, const Weight& w, Ten
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
     }
-    kSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, w, out, stream);
+    if (x.ne[1] <= 8) {
+        kSmallTExactLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, w, out, stream);
+    } else {
+        kSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, w, out, stream);
+    }
 }
 
 } // namespace ninfer::ops::detail

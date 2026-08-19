@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
+#include "ops/linear/q5/q5_rowsplit_gemv.cuh"
 
 #include <cuda_bf16.h>
 
@@ -31,6 +32,25 @@ void dispatch_shape(const Tensor& x, const Weight& w, Tensor& residual_out, cuda
         launch_split2<Cols, 17, 17408>(x, w, residual_out, stream);
     } else {
         throw std::invalid_argument("q5 linear_add split2: unsupported exact K");
+    }
+}
+
+template <int Cols>
+void launch_small_t_exact(const Tensor& x, const Weight& w, Tensor& residual_out,
+                          cudaStream_t stream) {
+    const auto* xp     = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
+    const auto* high   = static_cast<const std::uint8_t*>(w.qhigh);
+    const auto* scales = static_cast<const std::uint8_t*>(w.scales);
+    auto* out          = static_cast<__nv_bfloat16*>(residual_out.data);
+    if (w.k == 6144) {
+        q5_rowsplit_gemv_small_t_exact_residual_launch_kernel<5120, 6144, 16, 2, Cols>(
+            xp, codes, high, scales, out, stream);
+    } else if (w.k == 17408) {
+        q5_rowsplit_gemv_small_t_exact_residual_launch_kernel<5120, 17408, 16, 2, Cols>(
+            xp, codes, high, scales, out, stream);
+    } else {
+        throw std::invalid_argument("q5 linear_add small-T exact: unsupported exact K");
     }
 }
 
@@ -66,7 +86,13 @@ void dispatch_cols(std::int32_t cols, Launch&& launch) {
 
 void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream) {
-    dispatch_cols(x.ne[1], [&]<int Cols>() { dispatch_shape<Cols>(x, w, residual_out, stream); });
+    dispatch_cols(x.ne[1], [&]<int Cols>() {
+        if constexpr (Cols <= 8) {
+            launch_small_t_exact<Cols>(x, w, residual_out, stream);
+        } else {
+            dispatch_shape<Cols>(x, w, residual_out, stream);
+        }
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 

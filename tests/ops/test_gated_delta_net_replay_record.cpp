@@ -121,6 +121,35 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states, valid,
                                        initial, key_record_tensor, value_record_tensor,
                                        gate_record_tensor, record_output, nullptr);
+
+    DeviceBuffer direct_state;
+    DeviceBuffer direct_out;
+    if (batch == 1 && dense) {
+        const std::size_t slot_elements =
+            static_cast<std::size_t>(kStateDim) * kStateDim * value_heads;
+        const std::size_t initial_offset =
+            static_cast<std::size_t>(initial_slots[0]) * slot_elements;
+        direct_state = to_device(std::vector<float>(
+            state.begin() + static_cast<std::ptrdiff_t>(initial_offset),
+            state.begin() + static_cast<std::ptrdiff_t>(initial_offset + slot_elements)));
+        direct_out = DeviceBuffer(value_elements * sizeof(std::uint16_t));
+        direct_out.fill(0xff);
+        Tensor direct_state_tensor(direct_state.p, DType::FP32,
+                                   {kStateDim, kStateDim, value_heads});
+        Tensor direct_output(direct_out.p, DType::BF16,
+                             {kStateDim, value_heads, width, 1});
+        WorkspaceArena direct_workspace(256);
+        for (std::int32_t token = 0; token < width; ++token) {
+            Tensor q_one = q.slice(2, token, 1);
+            Tensor k_one = k.slice(2, token, 1);
+            Tensor v_one = v.slice(2, token, 1);
+            Tensor g_one = g_tensor.slice(1, token, 1);
+            Tensor beta_one = beta_tensor.slice(1, token, 1);
+            Tensor out_one = direct_output.slice(2, token, 1);
+            ops::gated_delta_net(q_one, k_one, v_one, g_one, beta_one, kScale, true,
+                                 direct_workspace, direct_state_tensor, out_one, nullptr);
+        }
+    }
     cuda_synchronize();
 
     int failures             = 0;
@@ -132,6 +161,11 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         from_device<std::uint16_t>(record_out, value_elements);
     failures +=
         verify_equal("replay record output" + suffix, snapshot_output_bits, record_output_bits);
+    if (batch == 1 && dense) {
+        failures += verify_equal("replay record vs sequential direct output" + suffix,
+                                 record_output_bits,
+                                 from_device<std::uint16_t>(direct_out, value_elements));
+    }
 
     const std::vector<std::uint16_t> key_bits_after =
         from_device<std::uint16_t>(key_record, qk_elements);

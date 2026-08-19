@@ -88,6 +88,19 @@ struct Q4GdnSmallTEpilogue {
     }
 };
 
+template <int Tokens, class Publish>
+struct Q4GdnExactEpilogue {
+    GdnConvEpilogue<Publish> conv;
+
+    template <bool, int, int ProducedTokens>
+    __device__ __forceinline__ void operator()(__nv_bfloat16*, __nv_bfloat16*, std::int32_t,
+                                               std::int32_t, std::int32_t row,
+                                               const float (&values)[ProducedTokens]) const {
+        static_assert(ProducedTokens == Tokens);
+        conv.store(row, values);
+    }
+};
+
 template <class Publish>
 struct Q5GdnDecodeEpilogue {
     GdnConvEpilogue<Publish> conv;
@@ -189,26 +202,29 @@ template <int Tokens, class Q4Schedule, class Publish, bool TriggerPdl, bool Joi
 void launch_q4_small_t(const Tensor& x, const Weight& qk_weight,
                        const GdnConvEpilogue<Publish>& qk_epilogue, Tensor& query,
                        cudaStream_t stream) {
-    const dim3 q4_grid(kQkRows / Q4Schedule::kRowsPerCta, 1u, 1u);
+    using ExactSchedule = Q4GemvR1W8DirectSchedule;
+    constexpr int q4_blocks  = kQkRows / ExactSchedule::kRowsPerCta;
+    constexpr int q4_threads = ExactSchedule::kThreads;
     if constexpr (Dependent) {
         CUDA_CHECK(pdl::launch_dependent(
-            {q4_grid, dim3(Q4Schedule::kThreads), 0, stream},
-            q4_rowsplit_gemm_simt_kernel<Q4Schedule, false, false, 0,
-                                         Q4GdnSmallTEpilogue<Tokens, Publish>, TriggerPdl, JoinPdl>,
+            {dim3(q4_blocks), dim3(q4_threads), 0, stream},
+            q4_rowsplit_gemv_small_t_exact_kernel<ExactSchedule, Tokens,
+                                                   Q4GdnExactEpilogue<Tokens, Publish>, TriggerPdl,
+                                                   JoinPdl>,
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(qk_weight.qdata),
             static_cast<const std::uint8_t*>(qk_weight.scales),
-            static_cast<__nv_bfloat16*>(query.data), nullptr, kQueryRows, 0, kQkRows, kHidden,
-            Tokens, kHidden, Q4GdnSmallTEpilogue<Tokens, Publish>{qk_epilogue}));
+            static_cast<__nv_bfloat16*>(query.data), nullptr, kQkRows, kHidden,
+            Q4GdnExactEpilogue<Tokens, Publish>{qk_epilogue}));
     } else {
-        q4_rowsplit_gemm_simt_kernel<Q4Schedule, false, false, 0,
-                                     Q4GdnSmallTEpilogue<Tokens, Publish>, TriggerPdl, JoinPdl>
-            <<<q4_grid, Q4Schedule::kThreads, 0, stream>>>(
+        q4_rowsplit_gemv_small_t_exact_kernel<ExactSchedule, Tokens,
+                                               Q4GdnExactEpilogue<Tokens, Publish>, TriggerPdl,
+                                               JoinPdl><<<q4_blocks, q4_threads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const std::uint8_t*>(qk_weight.qdata),
                 static_cast<const std::uint8_t*>(qk_weight.scales),
-                static_cast<__nv_bfloat16*>(query.data), nullptr, kQueryRows, 0, kQkRows, kHidden,
-                Tokens, kHidden, Q4GdnSmallTEpilogue<Tokens, Publish>{qk_epilogue});
+                static_cast<__nv_bfloat16*>(query.data), nullptr, kQkRows, kHidden,
+                Q4GdnExactEpilogue<Tokens, Publish>{qk_epilogue});
     }
 }
 
@@ -216,35 +232,34 @@ template <int Tokens, class Publish, bool TriggerPdl, bool JoinPdl, bool Depende
 void launch_q5_small_t(const Tensor& x, const Weight& value_z_weight,
                        const GdnConvEpilogue<Publish>& value_epilogue, Tensor& value, Tensor& z,
                        cudaStream_t stream) {
-    constexpr int q5_threads = 4 * 32;
-    const dim3 q5_grid(kValueZRows, 1u, 1u);
+    constexpr int q5_rows_per_block = 16;
+    constexpr int q5_threads        = q5_rows_per_block * 32;
+    constexpr int q5_blocks         = kValueZRows / q5_rows_per_block;
     if constexpr (Dependent) {
         CUDA_CHECK(pdl::launch_dependent(
-            {q5_grid, dim3(q5_threads), 0, stream},
-            q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Tokens, 5, kHidden, true,
-                                                kValueRows, Q5GdnSmallTEpilogue<Tokens, Publish>,
-                                                TriggerPdl, JoinPdl>,
+            {dim3(q5_blocks), dim3(q5_threads), 0, stream},
+            q5_rowsplit_gemv_small_t_exact_kernel<
+                kValueZRows, kHidden, q5_rows_per_block, 2, Tokens,
+                Q5GdnSmallTEpilogue<Tokens, Publish>, TriggerPdl, JoinPdl>,
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(value_z_weight.qdata),
             static_cast<const std::uint8_t*>(value_z_weight.qhigh),
             static_cast<const std::uint8_t*>(value_z_weight.scales),
             static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
-            kValueZRows, kValueRows, kHidden, Tokens, kHidden, 5,
             Q5GdnSmallTEpilogue<Tokens, Publish>{
                 value_epilogue,
                 static_cast<__nv_bfloat16*>(z.data),
             }));
     } else {
-        q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Tokens, 5, kHidden, true,
-                                            kValueRows, Q5GdnSmallTEpilogue<Tokens, Publish>,
-                                            TriggerPdl, JoinPdl>
-            <<<q5_grid, q5_threads, 0, stream>>>(
+        q5_rowsplit_gemv_small_t_exact_kernel<
+            kValueZRows, kHidden, q5_rows_per_block, 2, Tokens,
+            Q5GdnSmallTEpilogue<Tokens, Publish>, TriggerPdl, JoinPdl>
+            <<<q5_blocks, q5_threads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const std::uint8_t*>(value_z_weight.qdata),
                 static_cast<const std::uint8_t*>(value_z_weight.qhigh),
                 static_cast<const std::uint8_t*>(value_z_weight.scales),
                 static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
-                kValueZRows, kValueRows, kHidden, Tokens, kHidden, 5,
                 Q5GdnSmallTEpilogue<Tokens, Publish>{
                     value_epilogue,
                     static_cast<__nv_bfloat16*>(z.data),

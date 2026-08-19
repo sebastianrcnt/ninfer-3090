@@ -1,13 +1,17 @@
 # DFlash 2 speculative decoding for Qwen3.8-27B on RTX 3090
 
-Status: complete for the RTX 3090 single-user target. The final lossless DFlash 2 path reaches
-103.5 tok/s on GSM8K and 94.2 tok/s on HumanEval using kernel changes only.
+Status: DFlash 2 is functionally complete for the RTX 3090 single-user target.  The real 27B
+artifact now passes a 64-token, three-prompt greedy identity test with draft length seven for
+both INT8 and TurboQuant KV.  The earlier 103.5 tok/s GSM8K and 94.2 tok/s HumanEval numbers were
+measured on the faster pre-closure small-T path; they must not be presented as throughput of the
+final bit-identical path.
 
 TurboQuant extension status: implemented and serving at 262K capacity.  Mixed Korean, English,
-code, and arithmetic retrieval passes at 31.5K, 97.9K, and 261.9K, and a 512-token DFlash decode
-is stable.  The strict no-throughput-regression contract is still open: at 31.5K, TurboQuant
-prefill is 757.1 tok/s versus the same-harness INT8 result of 839.7 tok/s (-9.8%).  Do not read
-the completed DFlash 2 status above as completion of this later extension.
+code, and arithmetic retrieval passes at 31.5K and 97.9K on the final exact build.  The strict
+no-throughput-regression contract remains open:
+prefill is still below INT8, and exact small-T verification also reduced observed decode from
+32.3 to 24.3--26.0 tok/s at 31.5K and from 17.2 to 15.2 tok/s at 97.9K.  Do not read functional
+completion as completion of that throughput criterion.
 
 Hardware: one RTX 3090 (GA102, `sm_86`, 24 GiB, 936 GB/s), driver 590.48.01, CUDA 13.1.
 Target artifact: `qwen3_8_27b.ninfer`, 18,210,531,328 B on disk, 16.67 GiB resident.
@@ -88,8 +92,9 @@ Acceptance lengths are from the model card (measured on one H200, block size 8):
 
 This was the estimate used before the kernels existed. It proved optimistic because it assumed
 the eight-position verify compute could be hidden behind the target weight stream. The final
-measured result is 103.5 tok/s on GSM8K and 94.2 tok/s on HumanEval; the later ceiling analysis
-explains why 130 tok/s is not a credible kernel-only target on this card.
+fast-candidate result was 103.5 tok/s on GSM8K and 94.2 tok/s on HumanEval; the later ceiling
+analysis explains why 130 tok/s is not a credible kernel-only target on this card, and the final
+greedy-identity closure above records the additional exactness cost.
 
 ## Resident memory decision
 
@@ -284,9 +289,11 @@ Both pass at a 1e-3 relative criterion.
 
 ## Measured DFlash 2 results
 
-DFlash 2 decodes end to end and losslessly. The final measurement uses the same serving harness as
-the baseline: 2 warmup + 5 measured iterations, tg128, greedy, INT8 KV, CUDA Graphs, one request in
-flight, and a 32,768-token KV capacity.
+The first end-to-end DFlash 2 performance closure used the same serving harness as the baseline:
+2 warmup + 5 measured iterations, tg128, greedy, INT8 KV, CUDA Graphs, one request in flight, and
+a 32,768-token KV capacity.  Subsequent longer-output testing found that this fast path was not
+bit-identical to repeated T=1 target execution, so these figures are retained as an optimization
+baseline rather than claimed as the final lossless throughput.
 
 | Case | tokens/round | round ms | accept | server decode tok/s | client tok/s range |
 |---|---:|---:|---:|---:|---:|
@@ -294,18 +301,19 @@ flight, and a 32,768-token KV capacity.
 | HumanEval | **5.52** | 58.6 | 64.6% | **94.2** | 92.7-92.8 |
 | MT-Bench | **3.34** | 58.6 | 34.6% | 57.0 | 56.6-56.8 |
 
-The requested single-user thresholds are therefore met with margin: GSM8K is 3.5 tok/s over the
-100 tok/s target and HumanEval is 14.2 tok/s over the 80 tok/s target. Peak whole-device GPU memory
-was 20,966 MiB. The final raw run is
+This fast candidate met the requested single-user thresholds: GSM8K was 3.5 tok/s over the
+100 tok/s target and HumanEval was 14.2 tok/s over the 80 tok/s target. Peak whole-device GPU
+memory was 20,966 MiB. Its raw run is
 `scratchpad/dflash2/final_q45_small_t_lossless.json` outside the repository.
 
 The pre-kernel DFlash 2 measurement was 87.9 / 73.9 / 48.2 tok/s with 69-72 ms rounds. Relative to
-that handoff baseline, the final result is +17.7% / +27.5% / +18.3%, and the round is about 11 ms
-shorter. Acceptance is not manufactured by the optimization; the speedup comes from kernel time.
+that handoff baseline, the fast candidate was +17.7% / +27.5% / +18.3%, and its round was about
+11 ms shorter. Acceptance was not manufactured by the optimization; the speedup came from kernel
+time. These deltas predate the final exact SIMT replacement.
 
-### Small-T MMA kernels
+### Fast small-T MMA candidate
 
-The final path adds two exact T=2..8 routes:
+The performance candidate added two T=2..8 routes:
 
 | Operator | old T=8 | final T=8 | change | implementation |
 |---|---:|---:|---:|---|
@@ -320,9 +328,45 @@ the original 8-way reduction; lowering its `launch_bounds` minimum from three bl
 lets the compiler retain enough registers and changes T=8 from 179.2 to 136.3 us without changing
 the arithmetic.
 
-The Q5 planner routes only the real 5,120x17,408 MLP-down shape at T=2..8 to the new residual
-kernel; T=9..16 stays on the existing exact split-2 route. The Q4 specialization is confined to
-the 34,816x5,120 fused gate/up shape and T<=8. The wider generic paths are unchanged.
+The later real-artifact closure replaced the T=2..8 MMA routes with SIMT kernels that reproduce
+the T=1 FMA and reduction order. T=9..16 keeps the existing split-2 route.
+
+### Final greedy-identity closure
+
+The original four-token real test did not exercise enough decode rounds to expose every
+width-dependent difference.  The final test generates 64 tokens for three prompt families,
+first with ordinary target decoding and then with DFlash 2 at draft length seven.  It runs that
+comparison independently with INT8 and TurboQuant KV, requires identical token-id vectors, and
+also requires nonzero speculative rounds.
+
+To close the failures without another target-weight read per verified position, the final T=2..8
+path streams each Q4/Q5 weight tile once but maintains a separate FP32 accumulator for every
+position.  Per position it preserves the T=1 dequantization, FMA sequence, warp reduction, and
+epilogue order.  This applies to attention input projection, fused and materialized GDN input
+projection, gate/up SwiGLU, down/residual projection, and the output-side residual projections.
+The fixed-width TurboQuant attention path likewise matches sequential T=1 for every valid masked
+prefix; INT8 width 7--16 uses sequential one-token attention chunks because its split partition
+is defined by the chunk-final window.
+
+The cost is measurable.  On the final exact build, the 31,445-token retrieval request measured
+755.8 tok/s prefill and 24.3 tok/s decode on its cold request (26.0 tok/s on a cached repeat), while
+the 97,945-token request measured 503.6 tok/s prefill and 15.2 tok/s decode.  Both recovered all
+four needles.  These are the authoritative final-code numbers; the faster rows elsewhere in this
+document are explicitly historical baselines.
+
+The same final code was measured in a separate 32,768-token-capacity TurboQuant+DFlash service
+using the original tg128 greedy serving harness (two warmups and five measured requests per case):
+
+| Case | current TurboQuant exact | tokens/round | round ms | historical fast INT8 candidate |
+|---|---:|---:|---:|---:|
+| GSM8K | **70.4 tok/s** | 6.12 | 87.0 | 103.5 tok/s |
+| HumanEval | **60.7 tok/s** | 5.29 | 87.2 | 94.2 tok/s |
+| MT-Bench | **46.5 tok/s** | 3.43 | 73.8 | 57.0 tok/s |
+
+Peak whole-device use was 20,356 MiB.  The raw current run is
+`scratchpad/dflash2/turboquant_32k_exact_20260820.json` outside the repository.  The historical
+column is a different KV representation and is not a strict dtype-to-dtype comparison; it makes
+the exact small-T cost visible, not a TurboQuant-only attribution.
 
 ### Profiler findings and rejected approaches
 
@@ -386,7 +430,7 @@ Across the target's 16 full-attention layers and four KV heads this is 14.375 Ki
 3.59375 GiB at 262,144 tokens.  The preceding INT8 layout measured about 35 KiB/token, which would
 be 8.75 GiB at the same capacity.  TurboQuant therefore saves about 5.16 GiB (59%) of target KV
 at 262K and raises the deployed capacity from 98,304 to 262,144 tokens (2.67x), while retaining
-547.94 MiB of post-startup device headroom.
+551.94 MiB of post-startup device headroom on the final launch.
 
 ### GPU paths
 
@@ -426,8 +470,8 @@ tokens, and one request in flight.  Startup reports:
 | resolved KV capacity | 262,144 tokens / 4,096 pages |
 | runtime reservation | 4.46 GiB |
 | free after target weights | 4.98 GiB |
-| free after startup | **547.94 MiB** |
-| allocator slack | 529.53 MiB |
+| free after startup | **551.94 MiB** |
+| allocator slack | 533.53 MiB |
 | CUDA Graph use / allowance | 12.00 / 32.00 MiB |
 
 This exceeds the required 300 MiB device headroom while the desktop and Sunshine remain in their
@@ -444,9 +488,9 @@ normal state.
 | logical page 4,095 / position 262,143 append + decode | finite output, pass |
 | ordinary BF16/INT8 GQA public contract | pass |
 | Qwen runtime mechanism checks | pass |
-| real target + real DFlash 2 greedy losslessness | **PASS**, three prompt families |
+| real target + real DFlash 2 greedy losslessness | **PASS**, 64 tokens x three prompt families x INT8/TurboQuant KV |
 
-The final complete 88-entry suite took 143.70 seconds and retains exactly the eight documented
+The final complete 88-entry suite took 109.99 seconds and retains exactly the eight documented
 `sm_86`/NVFP4 and 1e-5 baseline failures; TurboQuant adds no regression.  Eight optional/real
 artifact tests skip without their environment variables; the real DFlash 2 test was also run
 separately with both artifacts and passed.
@@ -456,7 +500,8 @@ separately with both artifacts and passed.
 The reproducible harness `tools/bench/run_long_context_retrieval.py` distributes independent
 Korean, English, Python-expression, and arithmetic needles through the prompt.  Greedy generation
 with thinking disabled recovered all four values exactly at every measured extent:
-`해오라기-7319`, `cobalt-orbit-4821`, `x*x+1`, and `1591`.
+`해오라기-7319`, `cobalt-orbit-4821`, `x*x+1`, and `1591`.  The following table is the
+pre-greedy-identity performance baseline and is retained for direct comparison:
 
 | Input context | Result | prefill | decode | TTFT | wall | DFlash |
 |---:|---|---:|---:|---:|---:|---:|
@@ -464,18 +509,29 @@ with thinking disabled recovered all four values exactly at every measured exten
 | 97,945 | all four exact | **505.2 tok/s** | **17.2 tok/s** | 194.00 s | 196.21 s | 3.90 tok/round |
 | 261,953 | all four exact | **242.0 tok/s** | **7.3 tok/s** | 1083.00 s | 1088.17 s | 3.25 tok/round |
 
-The same 31.5K harness on INT8 KV measured 839.7 tok/s prefill and 32.8 tok/s decode.  TurboQuant
-therefore remains 9.8% behind in prefill and 1.5% behind in that request's observed decode; the
-latter varies with DFlash acceptance and has also measured 34.6 tok/s on TurboQuant.  Relative to
-the earlier stack-free TurboQuant implementation, Br=128 raises 31.5K prefill from 575.4 to
-757.1 tok/s and 97.9K prefill from 311.4 to 505.2 tok/s.  The 31.5K and 97.9K rows include the
-final paired centroid lookup; the 261.9K row was measured immediately before that exact,
-representation-preserving lookup optimization and is therefore conservative for the final code.
+The final exact build was then revalidated through the same live 262K service:
 
-A separate short-context stability request generated exactly 512 tokens and stopped at the output
-limit: 39 input tokens, 128.5 tok/s decode, 7.97 tok/round (99.6% acceptance), and 4.17 s wall time.
-This is above the pre-TurboQuant short-prompt GSM8K result of 103.5 tok/s and confirms that the
-small-T CUDA Graph/DFlash path is not the remaining throughput blocker.  Full-attention prefill is.
+| Input context | Result | prefill | decode | TTFT | wall | DFlash |
+|---:|---|---:|---:|---:|---:|---:|
+| 31,445 | all four exact | **755.8 tok/s** | **24.3 tok/s** cold / **26.0** cached | 41.65 s | 42.93 s | 3.10 cold / 3.55 cached |
+| 97,945 | all four exact | **503.6 tok/s** | **15.2 tok/s** | 194.64 s | 197.14 s | 3.90 tok/round |
+
+For 31,445 tokens the cold request used a 32-token output cap and stopped immediately before the
+last value; an identical cached repeat with a 64-token cap recovered all four.  The table combines
+the cold request's prefill statistic with both observed decode rates and states that distinction
+explicitly.
+
+The same 31.5K harness on INT8 KV measured 839.7 tok/s prefill and 32.8 tok/s decode.  The packed
+prompt path therefore remains about 10% behind in prefill.  Before greedy-identity closure its
+decode was only 1.5% behind and occasionally measured 34.6 tok/s, but the authoritative final
+exact measurements above show a larger decode gap. Relative to the earlier stack-free TurboQuant
+implementation, Br=128 raised 31.5K prefill from 575.4 to 757.1 tok/s and 97.9K prefill from 311.4
+to 505.2 tok/s; the final exact build retains essentially all of that prompt-side gain.
+
+A separate pre-closure short-context stability request generated exactly 512 tokens and stopped
+at the output limit: 39 input tokens, 128.5 tok/s decode, 7.97 tok/round (99.6% acceptance), and
+4.17 s wall time. It confirms graph and long-generation stability but is not a final exact-path
+throughput claim.
 
 Rejected prompt experiments are recorded so they are not repeated: Bc=32 was slower; CTA-wide and
 warp-private packed staging reduced uncoalesced transactions but increased spills and latency;
@@ -484,17 +540,16 @@ same 128-row reuse and was slightly slower; and reconstruct-then-INT8 QK added 1
 
 ### Remaining work
 
-The DFlash 2 goal is complete, but the TurboQuant extension is not complete until its 31.5K
-prefill closes the remaining 9.8% gap to INT8 (or that criterion is explicitly renegotiated).
-The next optimization must reduce packed Polar/QJL prompt-consumer cost; decode, capacity,
-retrieval quality, CUDA Graph stability, and DFlash losslessness are already closed.  Q4-only GDN
-scheduling and extra dequantization magic-number work are known dead ends for the separate
-short-context DFlash ceiling described above.
+Functional DFlash 2 and TurboQuant capacity are complete, but the throughput contract is not.
+TurboQuant prompt attention must close the 31.5K prefill gap to INT8, and the exact small-T target
+path must recover the decode regression quantified above. Capacity, retrieval quality, CUDA Graph
+stability, and DFlash greedy identity are closed. Q4-only GDN scheduling and extra dequantization
+magic-number work are known dead ends for the separate short-context ceiling described above.
 
 ## Verification status
 
 Final `ctest` on this build (`sm_86`, CUDA 13.1): **88 entries: 72 passed, 8 skipped, and the
-same 8 baseline failures**, 143.70 s. No new failure was introduced. The suite was run in the
+same 8 baseline failures**, 109.99 s. No new failure was introduced. The suite was run in the
 CUDA container with the source tree mounted at `/src` and one test process at a time.
 
 | Added test | Result |

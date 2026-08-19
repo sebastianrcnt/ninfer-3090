@@ -356,6 +356,31 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
             std::span<const double>(
                 full_reference.data(),
                 checked_elements(static_cast<std::int32_t>(oracle_rows.size()), t, "reference")));
+        if (t > 1 && t <= 8) {
+            test::GuardedDeviceBuffer sequential(output_words * sizeof(std::uint16_t));
+            sequential.copy_from_host(residual.data(), sequential.bytes());
+            Tensor sequential_out(sequential.data(), DType::BF16, {shape.n, t});
+            for (std::int32_t token = 0; token < t; ++token) {
+                Tensor input_one = input.slice(1, token, 1);
+                Tensor output_one = sequential_out.slice(1, token, 1);
+                workspace.reset();
+                ops::linear_add(input_one, weight, output_one, workspace, nullptr);
+            }
+            test::cuda_check(cudaDeviceSynchronize(), "synchronize sequential linear_add parity");
+            std::vector<std::uint16_t> wide_bits(output_words);
+            std::vector<std::uint16_t> sequential_bits(output_words);
+            test::cuda_check(cudaMemcpy(wide_bits.data(), output.data(), output.bytes(),
+                                        cudaMemcpyDeviceToHost),
+                             "copy wide linear_add parity output");
+            test::cuda_check(cudaMemcpy(sequential_bits.data(), sequential.data(),
+                                        sequential.bytes(), cudaMemcpyDeviceToHost),
+                             "copy sequential linear_add parity output");
+            if (wide_bits != sequential_bits) {
+                std::cerr << case_label << ": differs from sequential T=1 BF16 output\n";
+                ++failures;
+            }
+            failures += sequential.verify_guards((case_label + " sequential").c_str());
+        }
     }
     if (executed_peak != workspace_bytes) {
         std::cerr << label << ": interval workspace capacity has no executed high-water witness\n";
