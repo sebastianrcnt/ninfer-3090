@@ -516,4 +516,108 @@ void q4_rowsplit_gemv_kernel(
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 
+// Exact small-T form of the eight-warps-per-row decode schedule used by the 27B Q4
+// projections.  Every warp stages its ten-group weight slice once and keeps an independent
+// accumulator for each token.  The per-token FMAs, warp reduction, and eight partial sums are
+// deliberately ordered exactly as q4_rowsplit_gemv_kernel<T=1>.
+template <class Schedule, int Tokens, class Epilogue, bool TriggerPdl = false,
+          bool JoinPdl = false>
+__global__ __launch_bounds__(Schedule::kThreads, Schedule::kLaunchBoundsMinBlocks)
+void q4_rowsplit_gemv_small_t_exact_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16* __restrict__ out_tail, std::int32_t rows, std::int32_t k,
+    Epilogue epilogue = {}) {
+    constexpr int kRowsPerCta  = Schedule::kRowsPerCta;
+    constexpr int kWarpsPerRow = Schedule::kWarpsPerRow;
+    constexpr int kGroupsPerRow = Schedule::kStaticGroupsPerRow;
+    constexpr int kGroupsPerWarp = kGroupsPerRow / kWarpsPerRow;
+    constexpr int kActiveCodeVectors =
+        kGroupsPerWarp * Q4RowSplitStorage::kCodeBytesPerGroup / sizeof(uint4);
+    static_assert(Tokens >= 2 && Tokens <= 8);
+    static_assert(kRowsPerCta == 1 && kWarpsPerRow == 8);
+    static_assert(kGroupsPerRow > 0 && kGroupsPerWarp == 10);
+    static_assert(Schedule::kLaneMapping == Q4GemvLaneMapping::PackedByte2);
+    static_assert(Schedule::kDecodeMode == Q4GemvDecodeMode::ScalarInteger);
+    static_assert(Schedule::kCodeTransfer == Q4GemvCodeTransfer::SyncVector16);
+    static_assert(Schedule::kScaleAccess == Q4GemvScaleAccess::Scalar16Shuffle);
+    static_assert(Schedule::kPipelineStages == 1);
+
+    if constexpr (TriggerPdl) {
+        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
+    }
+
+    __shared__ Q4GemvTileStorage<Schedule> shared_tiles;
+    __shared__ float row_partials[Tokens][kWarpsPerRow];
+
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const int cta_warp    = static_cast<int>(threadIdx.x) >> 5;
+    const int warp_in_row = cta_warp;
+    const int row         = static_cast<int>(blockIdx.x);
+    const int group_begin = warp_in_row * kGroupsPerWarp;
+    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * kGroupsPerRow *
+                                               Q4RowSplitStorage::kCodeBytesPerGroup;
+    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroupsPerRow *
+                                                 Q4RowSplitStorage::kScaleBytesPerGroup;
+
+    auto* shared_codes       = shared_tiles.codes[cta_warp][0];
+    const auto* global_codes = reinterpret_cast<const uint4*>(
+        code_row + static_cast<std::int64_t>(group_begin) * Q4RowSplitStorage::kCodeBytesPerGroup);
+    if (lane < kActiveCodeVectors) { shared_codes[lane] = global_codes[lane]; }
+    __syncwarp();
+
+    std::uint16_t lane_scale_bits = 0;
+    if (lane < kGroupsPerWarp) {
+        lane_scale_bits = load_vec<std::uint16_t>(
+            scale_row + static_cast<std::int64_t>(group_begin + lane) *
+                            Q4RowSplitStorage::kScaleBytesPerGroup);
+    }
+
+    const auto* tile_codes = reinterpret_cast<const std::uint8_t*>(shared_codes);
+    float accumulators[Tokens] = {};
+#pragma unroll
+    for (int local_group = 0; local_group < kGroupsPerWarp; ++local_group) {
+        const std::uint16_t scale_bits = static_cast<std::uint16_t>(
+            __shfl_sync(kFullWarpMask, lane_scale_bits, local_group));
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+        const std::uint8_t packed =
+            tile_codes[local_group * Q4RowSplitStorage::kCodeBytesPerGroup + lane];
+        const int q0      = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
+        const int q1      = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
+        const int k_begin = (group_begin + local_group) * Q4RowSplitStorage::kGroupK + lane * 2;
+#pragma unroll
+        for (int token = 0; token < Tokens; ++token) {
+            const auto* activation_pairs = reinterpret_cast<const __nv_bfloat162*>(
+                x + static_cast<std::int64_t>(token) * k);
+            const float2 activation_pair =
+                __bfloat1622float2(activation_pairs[k_begin >> 1]);
+            accumulators[token] =
+                fmaf(static_cast<float>(q0) * scale, activation_pair.x, accumulators[token]);
+            accumulators[token] =
+                fmaf(static_cast<float>(q1) * scale, activation_pair.y, accumulators[token]);
+        }
+    }
+    __syncwarp();
+
+#pragma unroll
+    for (int token = 0; token < Tokens; ++token) {
+        const float partial = warp_reduce_sum(accumulators[token]);
+        if (lane == 0) { row_partials[token][warp_in_row] = partial; }
+    }
+    __syncthreads();
+
+    if (warp_in_row == 0 && lane == 0) {
+        float sums[Tokens] = {};
+#pragma unroll
+        for (int token = 0; token < Tokens; ++token) {
+#pragma unroll
+            for (int warp = 0; warp < kWarpsPerRow; ++warp) {
+                sums[token] += row_partials[token][warp];
+            }
+        }
+        epilogue.template operator()<false, 0, Tokens>(out, out_tail, 0, 0, row, sums);
+    }
+    if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
+}
+
 } // namespace ninfer::ops::detail

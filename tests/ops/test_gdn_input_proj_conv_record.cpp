@@ -1,4 +1,5 @@
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/causal_conv1d_silu.h"
 
 #include "ops/input_projection_test_common.h"
 
@@ -237,6 +238,88 @@ int run_q4_q5() {
     failures += run(7, 1, {5}, 1431U);
     failures += run(16, 1, {}, 1441U);
     failures += run(6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1451U);
+
+    // Target-only decode composes the projection and causal convolution at T=1, whereas target
+    // verification records a fused T=K+1 block.  Compare those two production paths directly;
+    // snapshot-vs-record parity alone does not cover the ordinary decode route.
+    {
+        constexpr std::int32_t kWidth = 2;
+        constexpr std::int32_t kChannels = kQueryRows + kKeyRows + kValueRows;
+        const std::vector<float> activation = make_bf16_activation(kHidden, kWidth, 1461U);
+        const std::vector<std::uint16_t> conv_bits =
+            make_bf16_bits(static_cast<std::size_t>(kChannels) * 4, 1463U, -0.02F, 0.02F);
+        const std::vector<std::uint16_t> state_bits =
+            make_bf16_bits(static_cast<std::size_t>(kChannels) * 3, 1465U, -0.05F, 0.05F);
+        DeviceBuffer dx = to_device_bf16(activation);
+        DeviceBuffer dc = to_device(conv_bits);
+        DeviceBuffer record_state = to_device(state_bits);
+        DeviceBuffer sequential_state = to_device(state_bits);
+        DeviceBuffer selector = to_device(std::vector<std::int32_t>{0});
+        DeviceBuffer conv_record(static_cast<std::size_t>(kChannels) * kWidth * sizeof(std::uint16_t));
+        DeviceBuffer rq(static_cast<std::size_t>(kQueryRows) * kWidth * sizeof(std::uint16_t));
+        DeviceBuffer rk(static_cast<std::size_t>(kKeyRows) * kWidth * sizeof(std::uint16_t));
+        DeviceBuffer rv(static_cast<std::size_t>(kValueRows) * kWidth * sizeof(std::uint16_t));
+        DeviceBuffer rz(static_cast<std::size_t>(kZRows) * kWidth * sizeof(std::uint16_t));
+        DeviceBuffer sq(rq.bytes), sk(rk.bytes), sv(rv.bytes), sz(rz.bytes);
+        DeviceBuffer projected(static_cast<std::size_t>(kChannels) * sizeof(std::uint16_t));
+        DeviceBuffer convolved(projected.bytes);
+        Tensor x(dx.p, DType::BF16, {kHidden, kWidth, 1});
+        Tensor conv(dc.p, DType::BF16, {kChannels, 4});
+        Tensor record_state_view(record_state.p, DType::BF16, {kChannels, 3, 1});
+        Tensor initial(selector.p, DType::I32, {1});
+        Tensor conv_record_view(conv_record.p, DType::BF16, {kChannels, kWidth, 1});
+        Tensor record_q(rq.p, DType::BF16, {kQueryRows, kWidth, 1});
+        Tensor record_k(rk.p, DType::BF16, {kKeyRows, kWidth, 1});
+        Tensor record_v(rv.p, DType::BF16, {kValueRows, kWidth, 1});
+        Tensor record_z(rz.p, DType::BF16, {kZRows, kWidth, 1});
+        const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+            kQueryRows, kKeyRows, kValueRows, 1, kWidth, kWidth);
+        WorkspaceArena record_workspace(std::max<std::size_t>(256, record_bytes));
+        ops::gdn_input_proj_conv_record(x, qk.view(), value_z.view(), conv, record_state_view,
+                                        Tensor{}, initial, conv_record_view, record_q, record_k,
+                                        record_v, record_z, record_workspace, nullptr);
+
+        Tensor sequential_state_view(sequential_state.p, DType::BF16, {kChannels, 3});
+        Tensor sequential_q(sq.p, DType::BF16, {kQueryRows, kWidth});
+        Tensor sequential_k(sk.p, DType::BF16, {kKeyRows, kWidth});
+        Tensor sequential_v(sv.p, DType::BF16, {kValueRows, kWidth});
+        Tensor sequential_z(sz.p, DType::BF16, {kZRows, kWidth});
+        Tensor projected_view(projected.p, DType::BF16, {kChannels, 1});
+        Tensor convolved_view(convolved.p, DType::BF16, {kChannels, 1});
+        for (std::int32_t token = 0; token < kWidth; ++token) {
+            Tensor x_one = x.slice(1, token, 1).view({kHidden, 1});
+            Tensor z_one = sequential_z.slice(1, token, 1);
+            ops::gdn_input_proj(x_one, qk.view(), value_z.view(), projected_view, z_one, nullptr);
+            ops::causal_conv1d_silu(projected_view, conv, sequential_state_view, convolved_view,
+                                    nullptr);
+            cuda_check(cudaMemcpyAsync(sequential_q.slice(1, token, 1).data, convolved.p,
+                                       static_cast<std::size_t>(kQueryRows) * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice),
+                       "copy sequential query");
+            cuda_check(cudaMemcpyAsync(sequential_k.slice(1, token, 1).data,
+                                       static_cast<std::uint16_t*>(convolved.p) + kQueryRows,
+                                       static_cast<std::size_t>(kKeyRows) * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice),
+                       "copy sequential key");
+            cuda_check(cudaMemcpyAsync(sequential_v.slice(1, token, 1).data,
+                                       static_cast<std::uint16_t*>(convolved.p) + kQueryRows + kKeyRows,
+                                       static_cast<std::size_t>(kValueRows) * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice),
+                       "copy sequential value");
+        }
+        cuda_synchronize();
+        if (from_device<std::uint16_t>(rq, rq.bytes / sizeof(std::uint16_t)) !=
+                from_device<std::uint16_t>(sq, sq.bytes / sizeof(std::uint16_t)) ||
+            from_device<std::uint16_t>(rk, rk.bytes / sizeof(std::uint16_t)) !=
+                from_device<std::uint16_t>(sk, sk.bytes / sizeof(std::uint16_t)) ||
+            from_device<std::uint16_t>(rv, rv.bytes / sizeof(std::uint16_t)) !=
+                from_device<std::uint16_t>(sv, sv.bytes / sizeof(std::uint16_t)) ||
+            from_device<std::uint16_t>(rz, rz.bytes / sizeof(std::uint16_t)) !=
+                from_device<std::uint16_t>(sz, sz.bytes / sizeof(std::uint16_t))) {
+            std::cerr << "Q4/Q5 record T=2 differs from sequential ordinary T=1\n";
+            ++failures;
+        }
+    }
     failures += qk.verify_preserved("Q4 record qk weight");
     failures += value_z.verify_preserved("Q5 record value/z weight");
     return failures;

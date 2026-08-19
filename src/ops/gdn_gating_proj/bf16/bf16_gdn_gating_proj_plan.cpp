@@ -28,7 +28,7 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 6> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
-    {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
+    {{2, 8}, Bf16GdnGatingScheduleId::SmallTExact},
     // sm_86 has 82 SMs, 64 Ki registers and 100 KiB of shared memory per SM. Every MMA route runs
     // 8 warps at 65 registers, so 8*32*72 = 18,432 registers admits three CTAs/SM while the 40 KiB
     // of dynamic shared memory admits two. Shared memory binds: 2 CTAs/SM -> 164 device-wide.
@@ -138,7 +138,7 @@ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     case Bf16GdnGatingScheduleId::MmaUnsplit:
         return true;
     case Bf16GdnGatingScheduleId::GemvPairedRows:
-    case Bf16GdnGatingScheduleId::SmallTSplit10:
+    case Bf16GdnGatingScheduleId::SmallTExact:
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
         return false;
@@ -152,8 +152,8 @@ std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
 
 std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
     switch (schedule) {
-    case Bf16GdnGatingScheduleId::SmallTSplit10:
-        return 10;
+    case Bf16GdnGatingScheduleId::SmallTExact:
+        return 1;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
         return 32;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
@@ -207,7 +207,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         switch (schedule) {
         case Bf16GdnGatingScheduleId::GemvPairedRows:
             return problem.cols == 1;
-        case Bf16GdnGatingScheduleId::SmallTSplit10:
+        case Bf16GdnGatingScheduleId::SmallTExact:
             return problem.cols >= 2 && problem.cols <= 8;
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
@@ -237,7 +237,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
         return cooperative_35_grid_is_resident(schedule, problem.cols);
     case Bf16GdnGatingScheduleId::GemvPairedRows:
-    case Bf16GdnGatingScheduleId::SmallTSplit10:
+    case Bf16GdnGatingScheduleId::SmallTExact:
         return false;
     }
     return false;
@@ -270,9 +270,9 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
     case Bf16GdnGatingScheduleId::GemvPairedRows:
         bf16_gdn_gating_proj_gemv_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
         return;
-    case Bf16GdnGatingScheduleId::SmallTSplit10:
-        bf16_gdn_gating_proj_small_t_split10_launch(x, a_weight, b_weight, A_log, dt_bias,
-                                                    scratch.data, scratch.bytes, g, beta, stream);
+    case Bf16GdnGatingScheduleId::SmallTExact:
+        bf16_gdn_gating_proj_small_t_exact_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                  stream);
         return;
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         bf16_gdn_gating_proj_35_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
@@ -353,8 +353,8 @@ const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noex
     switch (schedule) {
     case Bf16GdnGatingScheduleId::GemvPairedRows:
         return "gdn_gating_proj.bf16.gemv.paired_rows";
-    case Bf16GdnGatingScheduleId::SmallTSplit10:
-        return "gdn_gating_proj.bf16.small_t.split10";
+    case Bf16GdnGatingScheduleId::SmallTExact:
+        return "gdn_gating_proj.bf16.small_t.exact";
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         return "gdn_gating_proj.bf16.simt.warp_row.c4";
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:

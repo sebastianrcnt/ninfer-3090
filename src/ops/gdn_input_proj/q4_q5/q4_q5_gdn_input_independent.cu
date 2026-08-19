@@ -1,7 +1,6 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
 #include "core/device.h"
-#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
@@ -24,6 +23,41 @@ constexpr std::int32_t kHidden     = 5120;
 
 using Q4GdnSimtR8C4Schedule = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
 using Q4GdnSimtR8C8Schedule = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
+
+struct Q4GdnIndependentExactEpilogue {
+    std::int32_t out_ld;
+
+    template <bool, int, int Tokens>
+    __device__ __forceinline__ void operator()(__nv_bfloat16* out, __nv_bfloat16*, std::int32_t,
+                                               std::int32_t, std::int32_t row,
+                                               const float (&values)[Tokens]) const {
+#pragma unroll
+        for (int token = 0; token < Tokens; ++token) {
+            out[static_cast<std::int64_t>(token) * out_ld + row] =
+                __float2bfloat16_rn(values[token]);
+        }
+    }
+};
+
+struct Q5GdnIndependentExactEpilogue {
+    std::int32_t value_ld;
+
+    template <bool, int, int Tokens>
+    __device__ __forceinline__ void operator()(__nv_bfloat16* value, __nv_bfloat16* z,
+                                               std::int32_t, std::int32_t, std::int32_t row,
+                                               const float (&values)[Tokens]) const {
+#pragma unroll
+        for (int token = 0; token < Tokens; ++token) {
+            if (row < kValueRows) {
+                value[static_cast<std::int64_t>(token) * value_ld + row] =
+                    __float2bfloat16_rn(values[token]);
+            } else {
+                z[static_cast<std::int64_t>(token) * kZRows + row - kValueRows] =
+                    __float2bfloat16_rn(values[token]);
+            }
+        }
+    }
+};
 
 void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Schedule = Q4GemvR1W8DirectSchedule;
@@ -61,10 +95,50 @@ void launch_q4_simt_route(const Tensor& x, const Weight& weight, Tensor& out, cu
     }
 }
 
+template <int Tokens>
+void launch_q4_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    using Schedule = Q4GemvR1W8DirectSchedule;
+    constexpr int kBlocks = kQkRows / Schedule::kRowsPerCta;
+    const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
+    q4_rowsplit_gemv_small_t_exact_kernel<Schedule, Tokens, Q4GdnIndependentExactEpilogue>
+        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(out.data), nullptr, kQkRows, kHidden,
+            Q4GdnIndependentExactEpilogue{out_ld});
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     if (x.ne[1] == 1) {
         launch_q4_gemv(x, weight, out, stream);
         return;
+    }
+    switch (x.ne[1]) {
+    case 2:
+        launch_q4_exact<2>(x, weight, out, stream);
+        return;
+    case 3:
+        launch_q4_exact<3>(x, weight, out, stream);
+        return;
+    case 4:
+        launch_q4_exact<4>(x, weight, out, stream);
+        return;
+    case 5:
+        launch_q4_exact<5>(x, weight, out, stream);
+        return;
+    case 6:
+        launch_q4_exact<6>(x, weight, out, stream);
+        return;
+    case 7:
+        launch_q4_exact<7>(x, weight, out, stream);
+        return;
+    case 8:
+        launch_q4_exact<8>(x, weight, out, stream);
+        return;
+    default:
+        break;
     }
     if (x.ne[1] <= 4) {
         launch_q4_simt_route<Q4GdnSimtR8C4Schedule>(x, weight, out, stream);
@@ -92,42 +166,50 @@ void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor
 }
 
 template <int Cols>
-void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
-                      cudaStream_t stream) {
-    constexpr int kThreads    = 4 * 32;
+void launch_q5_exact(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                     cudaStream_t stream) {
+    constexpr int kRowsPerBlock = 16;
+    constexpr int kThreads      = kRowsPerBlock * 32;
+    constexpr int kBlocks       = kValueZRows / kRowsPerBlock;
     const std::int32_t out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
-    const dim3 grid(static_cast<unsigned>(kValueZRows), 1u, 1u);
-    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Cols, 5, kHidden, true, kValueRows>
-        <<<grid, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                        static_cast<const std::uint8_t*>(weight.qdata),
-                                        static_cast<const std::uint8_t*>(weight.qhigh),
-                                        static_cast<const std::uint8_t*>(weight.scales),
-                                        static_cast<__nv_bfloat16*>(value.data),
-                                        static_cast<__nv_bfloat16*>(z.data), kValueZRows, out_ld,
-                                        kHidden, Cols, weight.padded_shape[1], 5);
+    q5_rowsplit_gemv_small_t_exact_kernel<kValueZRows, kHidden, kRowsPerBlock, 2, Cols,
+                                           Q5GdnIndependentExactEpilogue>
+        <<<kBlocks, kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.qhigh),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
+            Q5GdnIndependentExactEpilogue{out_ld});
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
-                            cudaStream_t stream) {
+void launch_q5_small_t_exact(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                             cudaStream_t stream) {
     switch (x.ne[1]) {
     case 2:
-        launch_q5_split4<2>(x, weight, value, z, stream);
+        launch_q5_exact<2>(x, weight, value, z, stream);
         return;
     case 3:
-        launch_q5_split4<3>(x, weight, value, z, stream);
+        launch_q5_exact<3>(x, weight, value, z, stream);
         return;
     case 4:
-        launch_q5_split4<4>(x, weight, value, z, stream);
+        launch_q5_exact<4>(x, weight, value, z, stream);
         return;
     case 5:
-        launch_q5_split4<5>(x, weight, value, z, stream);
+        launch_q5_exact<5>(x, weight, value, z, stream);
         return;
     case 6:
-        launch_q5_split4<6>(x, weight, value, z, stream);
+        launch_q5_exact<6>(x, weight, value, z, stream);
+        return;
+    case 7:
+        launch_q5_exact<7>(x, weight, value, z, stream);
+        return;
+    case 8:
+        launch_q5_exact<8>(x, weight, value, z, stream);
         return;
     default:
-        throw std::invalid_argument("GDN Q5 split4 requires T in [2,6]");
+        throw std::invalid_argument("GDN Q5 exact small-T requires T in [2,8]");
     }
 }
 
@@ -157,8 +239,8 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
         launch_q5_gemv(x, weight, value, z, stream);
         return;
     }
-    if (x.ne[1] <= 6) {
-        launch_q5_split4_exact(x, weight, value, z, stream);
+    if (x.ne[1] <= 8) {
+        launch_q5_small_t_exact(x, weight, value, z, stream);
         return;
     }
     if (x.ne[1] <= 16) {
@@ -168,46 +250,11 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
 }
 
-void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                   Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
-    using Q4Schedule         = Q4GdnSimtR8C4Schedule;
-    constexpr int kQ5Threads = 4 * 32;
-    const dim3 q4_grid(kQkRows / Q4Schedule::kRowsPerCta, 1u, 1u);
-    const dim3 q5_grid(kValueZRows, 1u, 1u);
-    const std::int32_t q4_out_ld = static_cast<std::int32_t>(qk.nb[1] / sizeof(__nv_bfloat16));
-    const std::int32_t q5_out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
-
-    // Q5 and Q4 publish disjoint row ranges. Q4 can execute while Q5 drains and joins Q5 only at
-    // exit, before the following convolution/snapshot kernel becomes runnable.
-    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, 4, 5, kHidden, true, kValueRows,
-                                        Q5Split4StoreEpilogue, true, false>
-        <<<q5_grid, kQ5Threads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(value_z_weight.qdata),
-            static_cast<const std::uint8_t*>(value_z_weight.qhigh),
-            static_cast<const std::uint8_t*>(value_z_weight.scales),
-            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
-            kValueZRows, q5_out_ld, kHidden, 4, value_z_weight.padded_shape[1], 5);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(pdl::launch_dependent(
-        {q4_grid, dim3(Q4Schedule::kThreads), 0, stream},
-        q4_rowsplit_gemm_simt_kernel<Q4Schedule, true, false, 0, Q4SimtStoreEpilogue, false, true>,
-        static_cast<const __nv_bfloat16*>(x.data),
-        static_cast<const std::uint8_t*>(qk_weight.qdata),
-        static_cast<const std::uint8_t*>(qk_weight.scales), static_cast<__nv_bfloat16*>(qk.data),
-        nullptr, q4_out_ld, 0, kQkRows, kHidden, 4, qk_weight.padded_shape[1],
-        Q4SimtStoreEpilogue{}));
-}
-
 } // namespace
 
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream) {
-    if (x.ne[1] == 4) {
-        launch_t4_pdl(x, qk_weight, value_z_weight, qk, value, z, stream);
-        return;
-    }
     launch_q4(x, qk_weight, qk, stream);
     launch_q5(x, value_z_weight, value, z, stream);
 }

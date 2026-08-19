@@ -418,7 +418,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
             launch_profile.template operator()<Int8, true, false>();
         }
     };
-    if (cache.dtype == DType::I8 || cache.dtype == DType::U8) {
+    if (cache.dtype == DType::I8) {
         launch_for_dtype.template operator()<true>();
     } else {
         launch_for_dtype.template operator()<false>();

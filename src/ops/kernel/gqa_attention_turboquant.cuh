@@ -710,6 +710,8 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
     __shared__ __align__(32) __nv_bfloat16 tile[kKeyTile * tq::kHeadDim];
     __shared__ __align__(32) float scores[kMmaRows * kKeyTile];
     __shared__ int query_positions[TokenTile];
+    __shared__ int token_key_begin[TokenTile];
+    __shared__ int token_key_end[TokenTile];
     __shared__ int key_begin;
     __shared__ int key_end;
     __shared__ bool live_split;
@@ -718,21 +720,34 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
         qmatrix[index] = __float2bfloat16(0.0f);
     }
     if (d < TokenTile) {
-        query_positions[d] = d < valid_tokens ? batch_positions[d] : -1;
-    }
-    if (d == 0) {
-        const int window = valid_tokens == 0 ? 0 : batch_positions[valid_tokens - 1] + 1;
+        const int position = d < valid_tokens ? batch_positions[d] : -1;
+        query_positions[d] = position;
+        const int window = position < 0 ? 0 : position + 1;
+        // Every row must use the same split partition it gets during ordinary T=1 decode.
+        // Sharing the final row's partition across a speculative block changes softmax reduction
+        // boundaries and makes target verification width-dependent.
         const int active = window == 0
                                ? 0
-                               : gqa_small_t_active_splits<Geometry, true>(window, splits,
-                                                                           TokenTile);
-        live_split = split < active;
+                               : gqa_small_t_active_splits<Geometry, false>(window, splits, 1);
         const int per_split = active == 0 ? 0 : div_up(window, active);
-        key_begin = split * per_split;
-        key_end   = min(window, key_begin + per_split);
+        token_key_begin[d] = split < active ? split * per_split : 0;
+        token_key_end[d] = split < active ? min(window, token_key_begin[d] + per_split) : 0;
     }
     __syncthreads();
-    if (!live_split || key_begin >= key_end) { return; }
+    if (d == 0) {
+        key_begin = logical_capacity;
+        key_end   = 0;
+#pragma unroll
+        for (int token = 0; token < TokenTile; ++token) {
+            if (token_key_begin[token] < token_key_end[token]) {
+                key_begin = min(key_begin, token_key_begin[token]);
+                key_end   = max(key_end, token_key_end[token]);
+            }
+        }
+        live_split = key_begin < key_end;
+    }
+    __syncthreads();
+    if (!live_split) { return; }
 
     // Six warps transform the six query heads concurrently; each warp retains eight dimensions
     // per lane, so no temporary BF16 expansion exists outside this CTA.
@@ -865,20 +880,24 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
 #pragma unroll
                 for (int j = 0; j < kKeyTile; ++j) {
                     const int key = tile_begin + j;
-                    if (key >= key_end || key > query_positions[token]) { continue; }
+                    if (key < token_key_begin[token] || key >= token_key_end[token] ||
+                        key > query_positions[token]) {
+                        continue;
+                    }
                     const float score = scores[row * kKeyTile + j] * scale;
                     const float nm = fmaxf(maximum[token], score);
                     const float alpha = maximum[token] == -CUDART_INF_F
                                             ? 0.0f
                                             : expf(maximum[token] - nm);
                     const float probability = expf(score - nm);
-                    denominator[token] = denominator[token] * alpha + probability;
+                    denominator[token] = fmaf(denominator[token], alpha, probability);
                     maximum[token] = nm;
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
-                        acc[token][i] = acc[token][i] * alpha +
-                                        probability * __bfloat162float(
-                                                          tile[j * tq::kHeadDim + lane + 32 * i]);
+                        const float scaled_acc = acc[token][i] * alpha;
+                        const float value = __bfloat162float(
+                            tile[j * tq::kHeadDim + lane + 32 * i]);
+                        acc[token][i] = fmaf(probability, value, scaled_acc);
                     }
                 }
             }

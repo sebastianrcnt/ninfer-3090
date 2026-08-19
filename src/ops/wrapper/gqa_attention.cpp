@@ -331,8 +331,10 @@ template <typename Launch>
 void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceArena& workspace,
                             DType cache_dtype, GqaExecutionEnvelope envelope, Tensor& out,
                             Launch&& launch) {
-    for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
-        const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
+    const std::int32_t chunk_tokens =
+        cache_dtype == DType::I8 && q.ne[2] > kSmallTChunkTokens ? 1 : kSmallTChunkTokens;
+    for (std::int32_t begin = 0; begin < q.ne[2]; begin += chunk_tokens) {
+        const std::int32_t count = std::min(chunk_tokens, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache_dtype, envelope);
@@ -349,8 +351,13 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
                             cudaStream_t stream) {
-    for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
-        const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
+    // The INT8 producer partitions every token against a chunk-wide final window.  Executing
+    // speculative columns one at a time preserves the exact T=1 softmax partial boundaries and
+    // reduction order.  TurboQuant has its own token-specific ranges and keeps the fused chunk.
+    const std::int32_t chunk_tokens =
+        cache.dtype == DType::I8 && q.ne[2] > kSmallTChunkTokens ? 1 : kSmallTChunkTokens;
+    for (std::int32_t begin = 0; begin < q.ne[2]; begin += chunk_tokens) {
+        const std::int32_t count = std::min(chunk_tokens, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache.dtype, envelope);
@@ -430,6 +437,9 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         return layout.peak_bytes(1);
     };
     const auto exact_capacity = [&](std::int32_t width) {
+        if (cache_dtype == DType::I8 && width > kSmallTChunkTokens) {
+            return chunk_capacity(1);
+        }
         const detail::GqaAttentionRoute route = cache_dtype == DType::U8 && width <= 8
                                                     ? detail::GqaAttentionRoute::SmallT
                                                     : detail::gqa_attention_resolve_route(
@@ -474,9 +484,11 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
 
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
-        cache.storage == KvCacheStorage::TurboQuant && width <= 8
-            ? detail::GqaAttentionRoute::SmallT
-            : detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
+        cache.dtype == DType::I8 && width > kSmallTChunkTokens && width <= kMaximumVerifyTokens
+            ? detail::GqaAttentionRoute::ChunkedSmallT
+            : (cache.storage == KvCacheStorage::TurboQuant && width <= 8
+                   ? detail::GqaAttentionRoute::SmallT
+                   : detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope));
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream);
@@ -530,9 +542,12 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
 
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
-        cache.storage == KvCacheStorage::TurboQuant && q.ne[2] <= 8
-            ? detail::GqaAttentionRoute::SmallT
-            : detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope);
+        cache.dtype == DType::I8 && q.ne[2] > kSmallTChunkTokens &&
+                q.ne[2] <= kMaximumVerifyTokens
+            ? detail::GqaAttentionRoute::ChunkedSmallT
+            : (cache.storage == KvCacheStorage::TurboQuant && q.ne[2] <= 8
+                   ? detail::GqaAttentionRoute::SmallT
+                   : detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope));
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
         return;

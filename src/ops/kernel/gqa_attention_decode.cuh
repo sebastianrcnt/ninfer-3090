@@ -115,7 +115,18 @@ __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_
     } else {
         splits = gqa_small_t_default_splits<Geometry>(window);
     }
-    return splits < launch_capacity ? splits : launch_capacity;
+    splits = splits < launch_capacity ? splits : launch_capacity;
+    // Preserve the established INT8 small-T partition/reduction contract.  TurboQuant uses the
+    // T=1-equivalent non-empty range count below; INT8 partials are produced against the shared
+    // final-column window and its reducer must consume that same launch extent.
+    if constexpr (Int8) { return splits; }
+    splits = splits < window ? splits : window;
+    // The partial kernels use equal ceil-divided ranges.  For e.g. five keys and four requested
+    // splits that creates only three non-empty ranges ([0,2), [2,4), [4,5)); the fourth CTA
+    // returns without publishing statistics.  Return the number of ranges that actually contain
+    // keys so the reducer never consumes an unwritten slot.
+    const int keys_per_split = div_up(window, splits);
+    return div_up(window, keys_per_split);
 }
 
 __device__ __forceinline__ int gqa_small_t_tc_swz(int row, int col) {
@@ -167,7 +178,8 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
 
     if constexpr (Offset) { positions += column_begin; }
     if constexpr (MultiBatch) { positions += batch * full_width; }
-    const int last_pos = positions[tokens - 1];
+    const int query_pos = positions[token];
+    const int reduction_pos = Int8 ? positions[tokens - 1] : query_pos;
     int output_column  = token;
     if constexpr (Offset) { output_column += column_begin; }
     if constexpr (MultiBatch) { output_column += batch * full_width; }
@@ -182,7 +194,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         partial_l += partial_stat_row;
     }
 
-    const int window = last_pos + 1;
+    const int window = reduction_pos + 1;
     const int active_split_count =
         gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
 

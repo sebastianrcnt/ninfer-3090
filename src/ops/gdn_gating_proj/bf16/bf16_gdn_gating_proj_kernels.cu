@@ -175,6 +175,59 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
     }
 }
 
+// Process T<=8 columns together while retaining the decode GEMV's exact per-thread K ownership
+// and block-reduction tree.  This reuses each BF16 weight pair across the token tile without the
+// split-K regrouping that made Verify numerically different from repeated T=1 decode.
+__global__ void bf16_gdn_gating_proj_small_t_exact_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
+    const __nv_bfloat16* __restrict__ b_weight, const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias, float* __restrict__ g, float* __restrict__ beta,
+    std::int32_t t) {
+    const int global_row = static_cast<int>(blockIdx.x);
+    const bool is_b      = global_row >= kN;
+    const int row        = is_b ? global_row - kN : global_row;
+    const auto* weight   = is_b ? b_weight : a_weight;
+    __shared__ float warp_sums[kThreads / kWarpSize];
+
+    float acc[kSmallTMax];
+#pragma unroll
+    for (int token = 0; token < kSmallTMax; ++token) { acc[token] = 0.0F; }
+
+    constexpr int kPairs = kK / 2;
+    const std::int64_t row_base = static_cast<std::int64_t>(row) * kK;
+    const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* w2 = reinterpret_cast<const __nv_bfloat162*>(weight + row_base);
+    for (int p = static_cast<int>(threadIdx.x); p < kPairs; p += static_cast<int>(blockDim.x)) {
+        const float2 wf = bf16x2_to_float2(w2[p]);
+#pragma unroll
+        for (int token = 0; token < kSmallTMax; ++token) {
+            if (token < t) {
+                const float2 xf =
+                    bf16x2_to_float2(x2[static_cast<std::int64_t>(token) * kPairs + p]);
+                acc[token] = fmaf(wf.x, xf.x, acc[token]);
+                acc[token] = fmaf(wf.y, xf.y, acc[token]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int token = 0; token < kSmallTMax; ++token) {
+        if (token < t) {
+            const float sum = block_reduce_sum<kThreads>(acc[token], warp_sums);
+            if (threadIdx.x == 0) {
+                const std::int64_t output = static_cast<std::int64_t>(token) * kN + row;
+                if (is_b) {
+                    beta[output] = sigmoid(sum);
+                } else {
+                    const float sp = softplus(sum + dt_bias[row]);
+                    g[output]      = -expf(A_log[row]) * sp;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
 template <int ColsPerTile>
 __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                                     const __nv_bfloat16* __restrict__ a_weight,
@@ -345,36 +398,20 @@ void bf16_gdn_gating_proj_gemv_launch(const Tensor& x, const Weight& a_weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void bf16_gdn_gating_proj_small_t_split10_launch(const Tensor& x, const Weight& a_weight,
-                                                 const Weight& b_weight, const Tensor& A_log,
-                                                 const Tensor& dt_bias, void* workspace,
-                                                 std::size_t workspace_bytes, Tensor& g,
-                                                 Tensor& beta, cudaStream_t stream) {
+void bf16_gdn_gating_proj_small_t_exact_launch(const Tensor& x, const Weight& a_weight,
+                                               const Weight& b_weight, const Tensor& A_log,
+                                               const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                               cudaStream_t stream) {
     require_shape(a_weight, "a_weight");
     require_shape(b_weight, "b_weight");
-    const std::int32_t t       = x.ne[1];
-    const std::size_t required = static_cast<std::size_t>(kSmallTSplits) *
-                                 static_cast<std::size_t>(t) *
-                                 static_cast<std::size_t>(kLogicalRows) * sizeof(float);
-    if (workspace == nullptr || workspace_bytes < required) {
-        throw std::invalid_argument("gdn_gating_proj: small-T workspace is too small");
+    const std::int32_t t = x.ne[1];
+    if (t < 2 || t > kSmallTMax) {
+        throw std::invalid_argument("gdn_gating_proj: exact small-T requires T in [2,8]");
     }
-
-    dim3 partial_block(kSmallTThreads);
-    dim3 partial_grid(div_up(kLogicalRows, kSmallTRowsPerBlock), kSmallTSplits,
-                      div_up(t, kSmallTMax));
-    bf16_gdn_gating_proj_small_t_partial_kernel<kSmallTMax, kSmallTKSlice, kSmallTRowsPerBlock>
-        <<<partial_grid, partial_block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const __nv_bfloat16*>(a_weight.qdata),
-            static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<float*>(workspace), t);
-    CUDA_CHECK(cudaGetLastError());
-
-    constexpr int kReduceThreads = 128;
-    const int reduce_elems       = kN * t;
-    const int reduce_blocks      = div_up(reduce_elems, kReduceThreads);
-    bf16_gdn_gating_proj_small_t_reduce_kernel<<<reduce_blocks, kReduceThreads, 0, stream>>>(
-        static_cast<const float*>(workspace), static_cast<const float*>(A_log.data),
+    bf16_gdn_gating_proj_small_t_exact_kernel<<<2 * kN, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(a_weight.qdata),
+        static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
         static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
         static_cast<float*>(beta.data), t);
     CUDA_CHECK(cudaGetLastError());
