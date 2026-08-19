@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 namespace ninfer {
@@ -58,6 +59,26 @@ private:
     friend struct qwen3_6_27b::Package;
 };
 
+// Plan for a drafter supplied in its own container.
+class DraftLoadPlan {
+public:
+    DraftLoadPlan(DraftLoadPlan&&) noexcept;
+    DraftLoadPlan& operator=(DraftLoadPlan&&) noexcept;
+    ~DraftLoadPlan();
+
+    DraftLoadPlan(const DraftLoadPlan&)            = delete;
+    DraftLoadPlan& operator=(const DraftLoadPlan&) = delete;
+
+    [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
+
+private:
+    class Impl;
+    explicit DraftLoadPlan(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+
+    friend struct qwen3_6_27b::Package;
+};
+
 class LoadedModel {
 public:
     ~LoadedModel();
@@ -82,9 +103,11 @@ struct Package {
     static constexpr std::string_view target_key         = "qwen3_6_27b";
     static constexpr std::string_view qwen3_8_model_id   = "qwen3.8-27b";
     static constexpr std::string_view qwen3_8_target_key = "qwen3_8_27b";
+    static constexpr bool accepts_draft_artifact         = true;
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;
+    using DraftLoadPlan   = detail::DraftLoadPlan;
     using LoadedModel     = detail::LoadedModel;
     using Frontend        = detail::Frontend;
     using PreparedPrompt  = detail::PreparedPrompt;
@@ -99,8 +122,11 @@ struct Package {
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
+    [[nodiscard]] static DraftLoadPlan plan_draft_load(artifact::Binder& binder);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
-    construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
+    construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized,
+                           std::optional<DraftLoadPlan>&& draft_plan,
+                           std::optional<artifact::MaterializedArtifact>&& draft_materialized);
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model);
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
                                                                const EngineOptions& options,

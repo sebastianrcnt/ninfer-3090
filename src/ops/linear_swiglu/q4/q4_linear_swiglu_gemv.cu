@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <array>
+#include <type_traits>
 #include <utility>
 
 namespace ninfer::ops::detail {
@@ -41,11 +42,45 @@ struct Q4SwiGluSmallTGeometry {
     static constexpr int kGroupsPerRow = kK / kGroupK;
 };
 
+struct Q4SwiGluSmallTSchedule {
+    static constexpr int kKWarps            = 8;
+    static constexpr int kMinBlocksPerSm    = 2;
+    static constexpr auto kCodeCache        = Cache::cg;
+    static constexpr int kThreads           = kKWarps * 32;
+    static constexpr int kTileKPerWarp      = 64;
+    static constexpr int kGroupK            = kKWarps * kTileKPerWarp;
+    static constexpr int kRowsPerMmaTile    = 16;
+    static constexpr int kRowTilesPerCta    = 4;
+    static constexpr int kRowsPerCta        = kRowsPerMmaTile * kRowTilesPerCta;
+    static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;
+};
+
 struct Q4SwiGluSmallTRows {
-    static constexpr int kOutputRowsPerCta = 8;
+    static constexpr int kOutputRowsPerCta = 16;
+
+    // Local rows form two 16-row mma tiles. Within a tile the top half carries gate rows and
+    // the bottom half the matching up rows, so a single mma pair yields both operands of the
+    // SwiGLU product for one output row.
+    __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
+        return output_row0 + ((local_row >> 4) * 8) + (local_row & 7) +
+               (((local_row >> 3) & 1) != 0 ? kIntermediate : 0);
+    }
+
+    __device__ __forceinline__ int output_row_base(int output_row0, int tile) const {
+        return output_row0 + tile * 8;
+    }
+};
+
+struct Q4SwiGluWideSmallTRows {
+    static constexpr int kOutputRowsPerCta = 32;
 
     __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
-        return output_row0 + (local_row & 7) + (local_row >= 8 ? kIntermediate : 0);
+        return output_row0 + ((local_row >> 4) * 8) + (local_row & 7) +
+               (((local_row >> 3) & 1) != 0 ? kIntermediate : 0);
+    }
+
+    __device__ __forceinline__ int output_row_base(int output_row0, int tile) const {
+        return output_row0 + tile * 8;
     }
 };
 
@@ -71,14 +106,18 @@ template <int ActiveCols>
 void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
-    constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows::kOutputRowsPerCta;
+    using Schedule =
+        std::conditional_t<(ActiveCols <= 8), Q4SwiGluSmallTSchedule, Q4DraftSmallTSchedule>;
+    using Rows =
+        std::conditional_t<(ActiveCols <= 8), Q4SwiGluWideSmallTRows, Q4SwiGluSmallTRows>;
+    constexpr int kBlocks = kIntermediate / Rows::kOutputRowsPerCta;
     const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data)};
-    q4_small_t_mma_kernel<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
-                          Q4SwiGluSmallTRows>
-        <<<kBlocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
+    q4_small_t_mma_kernel<Schedule, Q4SwiGluSmallTGeometry, TileCols, ActiveCols,
+                          Q4SwiGluSmallTEpilogue, Rows>
+        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-            epilogue, Q4SwiGluSmallTRows{});
+            epilogue, Rows{});
     CUDA_CHECK(cudaGetLastError());
 }
 

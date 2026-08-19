@@ -260,11 +260,19 @@ struct DFlashAttentionRoots {
     Tensor query;
     Tensor key;
     Tensor attention;
+    // DFlash 2 only: the convolution wrapping this sublayer. Its output side has to
+    // run between the output projection and the residual add, so the projection
+    // cannot be the fused linear_add DFlash 1 uses.
+    Tensor conv_input;
+    Tensor conv_input_coef;
+    Tensor conv_output_coef;
+    Tensor sublayer_output;
+    Tensor conv_output;
 };
 
 template <class Config, class Allocator>
 DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens) {
-    return {
+    DFlashAttentionRoots roots{
         matrix(allocator, DType::BF16, Config::hidden, tokens),
         matrix(allocator, DType::BF16, Config::query_size, tokens),
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
@@ -273,19 +281,49 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens)
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::query_size, tokens),
     };
+    if constexpr (Config::convolution) {
+        constexpr int side_rows = Config::conv_taps * Config::conv_groups;
+        roots.conv_input        = matrix(allocator, DType::BF16, Config::hidden, tokens);
+        roots.conv_input_coef   = matrix(allocator, DType::BF16, side_rows, tokens);
+        roots.conv_output_coef  = matrix(allocator, DType::BF16, side_rows, tokens);
+        roots.sublayer_output   = matrix(allocator, DType::BF16, Config::hidden, tokens);
+        roots.conv_output       = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    }
+    return roots;
 }
 
 struct DFlashMlpRoots {
     Tensor hidden;
     Tensor intermediate;
+    // DFlash 2 only: the convolution wrapping this sublayer, and the separate gate
+    // and up halves it needs because the fused SwiGLU projection cannot sit between
+    // the convolution and the residual add.
+    Tensor conv_input;
+    Tensor conv_input_coef;
+    Tensor conv_output_coef;
+    Tensor gate;
+    Tensor up;
+    Tensor sublayer_output;
+    Tensor conv_output;
 };
 
 template <class Config, class Allocator>
 DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
-    return {
+    DFlashMlpRoots roots{
         matrix(allocator, DType::BF16, Config::hidden, tokens),
         matrix(allocator, DType::BF16, Config::intermediate, tokens),
     };
+    if constexpr (Config::convolution) {
+        constexpr int side_rows = Config::conv_taps * Config::conv_groups;
+        roots.conv_input        = matrix(allocator, DType::BF16, Config::hidden, tokens);
+        roots.conv_input_coef   = matrix(allocator, DType::BF16, side_rows, tokens);
+        roots.conv_output_coef  = matrix(allocator, DType::BF16, side_rows, tokens);
+        roots.gate              = matrix(allocator, DType::BF16, Config::intermediate, tokens);
+        roots.up                = matrix(allocator, DType::BF16, Config::intermediate, tokens);
+        roots.sublayer_output   = matrix(allocator, DType::BF16, Config::hidden, tokens);
+        roots.conv_output       = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    }
+    return roots;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe

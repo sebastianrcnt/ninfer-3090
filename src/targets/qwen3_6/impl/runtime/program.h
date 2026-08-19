@@ -166,6 +166,14 @@ struct RequestControl {
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
 
+    // DFlash can become counterproductive on distributions where its proposals are rarely
+    // accepted.  Keep a small per-request feedback controller; the configured draft window is
+    // still the allocation/capture maximum.
+    std::uint32_t dflash_adaptive_window = 0;
+    std::uint32_t dflash_feedback_rounds = 0;
+    std::uint32_t dflash_feedback_drafted = 0;
+    std::uint32_t dflash_feedback_accepted = 0;
+
     struct Prefill {
         PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;

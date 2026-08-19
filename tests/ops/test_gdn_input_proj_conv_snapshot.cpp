@@ -515,8 +515,9 @@ int run_q4_q5() {
     DevicePackedWeight value_z_weight(
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 619U));
     int failures = 0;
-    // Cover every fixed Small-T specialization plus the first composed extent.
-    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7}) {
+    // Cover every fixed Small-T specialization, including the block-8 extent the DFlash 2
+    // verify round issues, plus the composed extent at T=4.
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8}) {
         const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, initial_slot);
     }

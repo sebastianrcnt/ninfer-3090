@@ -103,6 +103,10 @@ ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_8_27b_dflash2_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_dflash2_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
@@ -208,6 +212,12 @@ ninfer_add_op_test(ninfer_swa_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
   SOURCES ops/test_kv_cache_append_prefix.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash_conv_test
+  SOURCES ops/test_dflash_conv.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash_selector_test
+  SOURCES ops/test_dflash_selector.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp

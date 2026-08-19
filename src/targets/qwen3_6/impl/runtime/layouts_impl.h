@@ -483,19 +483,57 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                                        width, batch),
                                      ops::bidirectional_gqa_attention_workspace_capacity_bytes(
                                          {0, plan.capacity}, width, width, batch)));
-                    scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::query_size, tokens, tokens));
+                    if constexpr (DFlashConfig::convolution) {
+                        // DFlash 2 splits the fused projections so the convolutions can
+                        // sit between them and the residual add.
+                        const auto linear_scratch = [&](std::int32_t out_rows,
+                                                        std::int32_t in_rows) {
+                            return ops::linear_workspace_capacity_bytes(
+                                QType::W8G32_F16S, out_rows, in_rows, ops::LinearPolicy::A16Only,
+                                tokens, tokens);
+                        };
+                        constexpr int side_rows =
+                            DFlashConfig::conv_taps * DFlashConfig::conv_groups;
+                        scratch(layout,
+                                std::max({linear_scratch(side_rows, DFlashConfig::hidden),
+                                          linear_scratch(DFlashConfig::query_size,
+                                                         DFlashConfig::hidden),
+                                          linear_scratch(DFlashConfig::kv_size,
+                                                         DFlashConfig::hidden),
+                                          linear_scratch(DFlashConfig::hidden,
+                                                         DFlashConfig::query_size)}));
+                    } else {
+                        scratch(layout, ops::linear_add_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, DFlashConfig::hidden,
+                                            DFlashConfig::query_size, tokens, tokens));
+                    }
                 }
                 {
                     auto mlp = layout.scope();
                     (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
-                    scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
-                                        DFlashConfig::hidden, tokens, tokens));
-                    scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::intermediate, tokens, tokens));
+                    if constexpr (DFlashConfig::convolution) {
+                        const auto linear_scratch = [&](std::int32_t out_rows,
+                                                        std::int32_t in_rows) {
+                            return ops::linear_workspace_capacity_bytes(
+                                QType::W8G32_F16S, out_rows, in_rows, ops::LinearPolicy::A16Only,
+                                tokens, tokens);
+                        };
+                        constexpr int side_rows =
+                            DFlashConfig::conv_taps * DFlashConfig::conv_groups;
+                        scratch(layout,
+                                std::max({linear_scratch(side_rows, DFlashConfig::hidden),
+                                          linear_scratch(DFlashConfig::intermediate,
+                                                         DFlashConfig::hidden),
+                                          linear_scratch(DFlashConfig::hidden,
+                                                         DFlashConfig::intermediate)}));
+                    } else {
+                        scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
+                                            DFlashConfig::hidden, tokens, tokens));
+                        scratch(layout, ops::linear_add_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, DFlashConfig::hidden,
+                                            DFlashConfig::intermediate, tokens, tokens));
+                    }
                 }
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
@@ -678,6 +716,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity,
                             static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
+                        if constexpr (DFlashConfig::convolution) {
+                            // DFlash 2 submits more nodes per round than DFlash 1, because its
+                            // projections are split apart so the convolutions can sit between
+                            // them and the residual add. With the profile count held to two
+                            // ranges a capture measures 10 MiB; this bound carries headroom
+                            // over that and over DFlash 1's own allowance.
+                            return 128ULL * kMiB;
+                        }
                         return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
                     },
                     "DFlash graph allowance");

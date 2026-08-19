@@ -57,9 +57,64 @@ constexpr auto k35bMtpProjectionLaunchers = make_launchers<W835bMtpProjectionGeo
                                                            kW835bMtpProjectionFirstSmallT>(
     std::make_index_sequence<kW835bMtpProjectionLastSmallT - kW835bMtpProjectionFirstSmallT + 1>{});
 
+constexpr auto kDFlash2ConvCoefficientLaunchers = make_launchers<W8DFlash2ConvCoefficientGeometry, kW8DFlash2FirstSmallT>(
+    std::make_index_sequence<kW8DFlash2LastSmallT - kW8DFlash2FirstSmallT + 1>{});
+constexpr auto kDFlash2QueryLaunchers = make_launchers<W8DFlash2QueryGeometry, kW8DFlash2FirstSmallT>(
+    std::make_index_sequence<kW8DFlash2LastSmallT - kW8DFlash2FirstSmallT + 1>{});
+constexpr auto kDFlash2KeyValueLaunchers = make_launchers<W8DFlash2KeyValueGeometry, kW8DFlash2FirstSmallT>(
+    std::make_index_sequence<kW8DFlash2LastSmallT - kW8DFlash2FirstSmallT + 1>{});
+constexpr auto kDFlash2AttentionOutputLaunchers = make_launchers<W8DFlash2AttentionOutputGeometry, kW8DFlash2FirstSmallT>(
+    std::make_index_sequence<kW8DFlash2LastSmallT - kW8DFlash2FirstSmallT + 1>{});
+constexpr auto kDFlash2MlpHalfLaunchers = make_launchers<W8DFlash2MlpHalfGeometry, kW8DFlash2FirstSmallT>(
+    std::make_index_sequence<kW8DFlash2LastSmallT - kW8DFlash2FirstSmallT + 1>{});
+constexpr auto kDFlash2SelectorLaunchers = make_launchers<W8DFlash2SelectorGeometry, kW8DFlash2FirstSmallT>(
+    std::make_index_sequence<kW8DFlash2LastSmallT - kW8DFlash2FirstSmallT + 1>{});
+
 } // namespace
 
 void launch_w8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (weight.n == W8DFlash2ConvCoefficientGeometry::kOutputRows && weight.k == W8DFlash2ConvCoefficientGeometry::kInputRows &&
+        weight.padded_shape[1] == W8DFlash2ConvCoefficientGeometry::kInputRows && x.ne[1] >= kW8DFlash2FirstSmallT &&
+        x.ne[1] <= kW8DFlash2LastSmallT) {
+        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8DFlash2FirstSmallT);
+        kDFlash2ConvCoefficientLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == W8DFlash2QueryGeometry::kOutputRows && weight.k == W8DFlash2QueryGeometry::kInputRows &&
+        weight.padded_shape[1] == W8DFlash2QueryGeometry::kInputRows && x.ne[1] >= kW8DFlash2FirstSmallT &&
+        x.ne[1] <= kW8DFlash2LastSmallT) {
+        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8DFlash2FirstSmallT);
+        kDFlash2QueryLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == W8DFlash2KeyValueGeometry::kOutputRows && weight.k == W8DFlash2KeyValueGeometry::kInputRows &&
+        weight.padded_shape[1] == W8DFlash2KeyValueGeometry::kInputRows && x.ne[1] >= kW8DFlash2FirstSmallT &&
+        x.ne[1] <= kW8DFlash2LastSmallT) {
+        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8DFlash2FirstSmallT);
+        kDFlash2KeyValueLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == W8DFlash2AttentionOutputGeometry::kOutputRows && weight.k == W8DFlash2AttentionOutputGeometry::kInputRows &&
+        weight.padded_shape[1] == W8DFlash2AttentionOutputGeometry::kInputRows && x.ne[1] >= kW8DFlash2FirstSmallT &&
+        x.ne[1] <= kW8DFlash2LastSmallT) {
+        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8DFlash2FirstSmallT);
+        kDFlash2AttentionOutputLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == W8DFlash2MlpHalfGeometry::kOutputRows && weight.k == W8DFlash2MlpHalfGeometry::kInputRows &&
+        weight.padded_shape[1] == W8DFlash2MlpHalfGeometry::kInputRows && x.ne[1] >= kW8DFlash2FirstSmallT &&
+        x.ne[1] <= kW8DFlash2LastSmallT) {
+        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8DFlash2FirstSmallT);
+        kDFlash2MlpHalfLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == W8DFlash2SelectorGeometry::kOutputRows && weight.k == W8DFlash2SelectorGeometry::kInputRows &&
+        weight.padded_shape[1] == W8DFlash2SelectorGeometry::kInputRows && x.ne[1] >= kW8DFlash2FirstSmallT &&
+        x.ne[1] <= kW8DFlash2LastSmallT) {
+        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8DFlash2FirstSmallT);
+        kDFlash2SelectorLaunchers[index](x, weight, out, stream);
+        return;
+    }
     if (weight.n == W8VocabularyProjectionGeometry::kOutputRows &&
         weight.k == W8VocabularyProjectionGeometry::kInputRows &&
         weight.padded_shape[1] == W8VocabularyProjectionGeometry::kInputRows &&

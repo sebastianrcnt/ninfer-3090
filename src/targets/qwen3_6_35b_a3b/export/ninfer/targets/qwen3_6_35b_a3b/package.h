@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <variant>
 #include <string_view>
 
 namespace ninfer {
@@ -81,6 +83,10 @@ struct Package {
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;
+    // This target's DFlash 1 drafter is carried inside its own artifact, so it
+    // never takes a separate drafter container.
+    using DraftLoadPlan   = std::monostate;
+    static constexpr bool accepts_draft_artifact = false;
     using LoadedModel     = detail::LoadedModel;
     using Frontend        = detail::Frontend;
     using PreparedPrompt  = detail::PreparedPrompt;
@@ -96,7 +102,9 @@ struct Package {
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
-    construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
+    construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized,
+                           std::optional<DraftLoadPlan>&& draft_plan,
+                           std::optional<artifact::MaterializedArtifact>&& draft_materialized);
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model);
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
                                                                const EngineOptions& options,

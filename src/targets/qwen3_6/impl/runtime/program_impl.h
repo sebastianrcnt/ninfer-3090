@@ -1362,6 +1362,10 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
     };
+    request.dflash_adaptive_window = draft_window;
+    request.dflash_feedback_rounds = 0;
+    request.dflash_feedback_drafted = 0;
+    request.dflash_feedback_accepted = 0;
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
     request.sampling_host.token_counts =
@@ -1958,7 +1962,21 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("DFlash batch membership is invalid");
     }
 
-    const std::uint32_t width           = draft_window + 1U;
+    // The adaptive path currently targets the single-request serving configuration.  Batched
+    // rows must share a shape, so retain the configured window for concurrent batches.
+    std::uint32_t active_window =
+        lanes.size() == 1
+            ? std::clamp(requests[lanes.front()].dflash_adaptive_window, 1U, draft_window)
+            : draft_window;
+    if (lanes.size() == 1) {
+        const SequenceState& sequence = sequences[lanes.front()];
+        const std::uint32_t pending_context =
+            sequence.execution_frontier - sequence.dflash_context_frontier;
+        if (pending_context > 1U) {
+            active_window = std::max(active_window, pending_context - 1U);
+        }
+    }
+    const std::uint32_t width           = active_window + 1U;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1986,7 +2004,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
         const std::uint32_t extent =
-            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
+            std::min({active_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
@@ -1995,19 +2013,20 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     const auto started = Clock::now();
     try {
         DecodeGraphExecutable* executable   = nullptr;
-        schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
+        schedule::DFlashEnvelopes envelopes =
+            dflash_envelopes(0, maximum_frontier, active_window);
         ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
-        if (use_cuda_graph) {
+        if (use_cuda_graph && active_window == draft_window) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "DFlash batch");
             executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
             envelopes       = dflash_envelopes(profile.min_execution_frontier,
-                                               profile.max_execution_frontier, draft_window);
+                                               profile.max_execution_frontier, active_window);
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     draft_window + 1ULL))};
+                                     active_window + 1ULL))};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2018,7 +2037,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
             const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+                std::min({active_window, max_by_budget, capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -2046,7 +2065,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                      draft_window, envelopes, target_envelope, executable);
+                                      active_window, envelopes, target_envelope, executable);
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -2079,6 +2098,26 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
+                }
+                if (lanes.size() == 1) {
+                    request.dflash_feedback_rounds += 1;
+                    request.dflash_feedback_drafted += extent;
+                    request.dflash_feedback_accepted += static_cast<std::uint32_t>(accepted_i);
+                    if (request.dflash_feedback_rounds >= 4) {
+                        const std::uint32_t drafted = request.dflash_feedback_drafted;
+                        const std::uint32_t accepted = request.dflash_feedback_accepted;
+                        // Hysteresis: fall quickly below 25% acceptance, recover only above 60%.
+                        if (drafted != 0 && 4U * accepted < drafted) {
+                            request.dflash_adaptive_window =
+                                active_window > 3U ? 3U : (active_window > 1U ? 1U : 1U);
+                        } else if (drafted != 0 && 5U * accepted >= 3U * drafted) {
+                            request.dflash_adaptive_window =
+                                active_window < 3U ? std::min(3U, draft_window) : draft_window;
+                        }
+                        request.dflash_feedback_rounds = 0;
+                        request.dflash_feedback_drafted = 0;
+                        request.dflash_feedback_accepted = 0;
+                    }
                 }
             }
             sequence.dflash_context_frontier = base_E;

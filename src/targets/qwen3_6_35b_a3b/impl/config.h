@@ -88,6 +88,16 @@ struct DFlashConfig {
     static constexpr float attention_scale = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{1,  6,  11, 16,
                                                                            22, 27, 32, 37};
+    // DFlash 1: no convolutions and no candidate selector. The shapes are declared
+    // as zero so shared code can name them inside a discarded `if constexpr` branch.
+    static constexpr bool convolution       = false;
+    static constexpr bool selector          = false;
+    static constexpr int block_size         = 0;
+    static constexpr int conv_taps          = 0;
+    static constexpr int conv_group_size    = 0;
+    static constexpr int conv_groups        = 0;
+    static constexpr int selector_rank      = 0;
+    static constexpr int selector_top_k     = 0;
 };
 
 inline constexpr float kAttentionScale                   = 0.0625F;

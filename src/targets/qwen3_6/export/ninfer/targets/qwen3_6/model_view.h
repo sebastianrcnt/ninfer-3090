@@ -57,9 +57,32 @@ struct OptimizedProposalWeights {
     Tensor token_ids;
 };
 
+// Two-tap grouped dynamic convolution wrapping one sublayer. One projection of the
+// sublayer input produces the per-group coefficients for both the input side and the
+// output side; the base kernel is per-channel and identity at tap 0. Empty for
+// DFlash 1, which has no convolutions.
+struct DFlashConvWeights {
+    Tensor base_kernel;
+    Weight kernel_projection;
+    // Row views of kernel_projection: the input side and the output side.
+    Weight input_side;
+    Weight output_side;
+
+    [[nodiscard]] bool present() const noexcept { return base_kernel.data != nullptr; }
+};
+
+// Candidate path selector. Scores each candidate at a block position against the
+// token chosen at the preceding position, then walks one path through the block.
+struct DFlashSelectorWeights {
+    Weight hidden_projection;
+    Tensor predecessor_codebook;
+    Tensor successor_codebook;
+};
+
 struct DFlashLayerWeights {
     Tensor input_norm;
     Weight query_key_value;
+    Weight context_query;
     Weight context_key;
     Weight context_value;
     Tensor query_norm;
@@ -67,7 +90,11 @@ struct DFlashLayerWeights {
     Weight attention_output;
     Tensor post_attention_norm;
     Weight gate_up;
+    Weight gate;
+    Weight up;
     Weight down;
+    DFlashConvWeights attention_conv;
+    DFlashConvWeights mlp_conv;
 };
 
 template <std::size_t Layers>
@@ -76,6 +103,7 @@ struct DFlashWeights {
     Tensor context_norm;
     std::array<DFlashLayerWeights, Layers> layers;
     Tensor final_norm;
+    std::optional<DFlashSelectorWeights> selector;
 };
 
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,

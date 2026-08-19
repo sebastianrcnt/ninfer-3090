@@ -1,5 +1,7 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 
+#include "targets/qwen3_6_27b/impl/config.h"
+
 #include "artifact/typed_binding.h"
 
 #include <algorithm>
@@ -412,8 +414,91 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     return load_plan;
 }
 
-LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+namespace {
+
+using DFC = DFlashConfig;
+
+DFlashConvPlan bind_draft_conv(artifact::Binder& binder, const std::string& prefix) {
+    return DFlashConvPlan{
+        .base_kernel = artifact::bind_device_tensor(
+            binder, prefix + "base_kernel", NumericFormat::BF16,
+            {2, static_cast<std::uint64_t>(DFC::conv_taps),
+             static_cast<std::uint64_t>(DFC::hidden)}),
+        .kernel_projection = bind_weight(
+            binder, prefix + "kernel_projection", NumericFormat::W8G32_F16S,
+            {static_cast<std::uint64_t>(DFC::conv_projection_rows),
+             static_cast<std::uint64_t>(DFC::hidden)}),
+    };
+}
+
+} // namespace
+
+DraftArtifactLoadPlan bind_draft_artifact(artifact::Binder& binder) {
+    if (!binder.has_object("dflash2/feature_projection")) {
+        throw artifact::ArtifactError(
+            "draft artifact does not contain DFlash 2 drafter weights");
+    }
+    DraftArtifactLoadPlan out;
+    DFlashPlan& dflash = out.bindings.dflash;
+
+    constexpr auto kHidden       = static_cast<std::uint64_t>(DFC::hidden);
+    constexpr auto kIntermediate = static_cast<std::uint64_t>(DFC::intermediate);
+    constexpr auto kQuerySize    = static_cast<std::uint64_t>(DFC::query_size);
+    constexpr auto kKvSize       = static_cast<std::uint64_t>(DFC::kv_size);
+    constexpr auto kHeadDim      = static_cast<std::uint64_t>(DFC::head_dim);
+    constexpr auto kRank         = static_cast<std::uint64_t>(DFC::selector_rank);
+    constexpr auto kVocab        = static_cast<std::uint64_t>(DFC::vocab_rows);
+
+    dflash.feature_projection =
+        bind_weight(binder, "dflash2/feature_projection", NumericFormat::W8G32_F16S,
+                    {kHidden, static_cast<std::uint64_t>(DFC::feature_rows)});
+    dflash.context_norm = artifact::bind_device_tensor(binder, "dflash2/context_norm",
+                                                       NumericFormat::BF16, {kHidden});
+
+    for (std::size_t layer = 0; layer < kDFlashLayers; ++layer) {
+        DFlashLayerPlan& target  = dflash.layers[layer];
+        const std::string prefix = "dflash2/layers/" + std::to_string(layer) + "/";
+        target.input_norm        = artifact::bind_device_tensor(
+            binder, prefix + "input_norm", NumericFormat::BF16, {kHidden});
+        target.query_key_value =
+            bind_weight(binder, prefix + "attention/query_key_value", NumericFormat::W8G32_F16S,
+                        {kQuerySize + 2 * kKvSize, kHidden});
+        target.query_norm = artifact::bind_device_tensor(
+            binder, prefix + "attention/query_norm", NumericFormat::BF16, {kHeadDim});
+        target.key_norm = artifact::bind_device_tensor(binder, prefix + "attention/key_norm",
+                                                       NumericFormat::BF16, {kHeadDim});
+        target.attention_output = bind_weight(binder, prefix + "attention/output",
+                                              NumericFormat::W8G32_F16S, {kHidden, kQuerySize});
+        target.post_attention_norm = artifact::bind_device_tensor(
+            binder, prefix + "post_attention_norm", NumericFormat::BF16, {kHidden});
+        target.mlp.gate_up  = bind_weight(binder, prefix + "mlp/gate_up",
+                                          NumericFormat::W8G32_F16S, {2 * kIntermediate, kHidden});
+        target.mlp.down     = bind_weight(binder, prefix + "mlp/down", NumericFormat::W8G32_F16S,
+                                          {kHidden, kIntermediate});
+        target.attention_conv = bind_draft_conv(binder, prefix + "attention_conv/");
+        target.mlp_conv       = bind_draft_conv(binder, prefix + "mlp_conv/");
+    }
+
+    dflash.final_norm = artifact::bind_device_tensor(binder, "dflash2/final_norm",
+                                                     NumericFormat::BF16, {kHidden});
+    dflash.selector.hidden_projection =
+        bind_weight(binder, "dflash2/selector/hidden_projection", NumericFormat::W8G32_F16S,
+                    {kRank, kHidden});
+    // Gathered per candidate rather than streamed: BF16 costs no bandwidth here and
+    // keeps quantisation error out of the path scores.
+    dflash.selector.predecessor_codebook = artifact::bind_device_tensor(
+        binder, "dflash2/selector/predecessor_codebook", NumericFormat::BF16, {kVocab, kRank});
+    dflash.selector.successor_codebook = artifact::bind_device_tensor(
+        binder, "dflash2/selector/successor_codebook", NumericFormat::BF16, {kVocab, kRank});
+
+    out.materialization = binder.finish();
+    return out;
+}
+
+LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
+                                 const DraftBindingPlan* draft_plan,
+                                 std::optional<artifact::MaterializedArtifact> draft_materialized)
+    : backing(std::move(materialized)), draft_backing(std::move(draft_materialized)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
@@ -516,6 +601,80 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                                NumericFormat::W8G32_F16S, 5120, 4608);
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
                                                                NumericFormat::BF16, {5120});
+    }
+
+    if (draft_plan != nullptr) {
+        if (!draft_backing.has_value()) {
+            throw std::logic_error("drafter plan supplied without a materialized drafter arena");
+        }
+        const artifact::MaterializedArtifact& draft = *draft_backing;
+        const DFlashPlan& source                    = draft_plan->dflash;
+        auto& target                                = runtime.dflash.emplace();
+
+        target.feature_projection = materialized_weight(draft, source.feature_projection,
+                                                        DFC::hidden, DFC::feature_rows);
+        target.context_norm       = artifact::materialized_tensor(
+            draft, source.context_norm, NumericFormat::BF16, {DFC::hidden});
+        for (std::size_t layer = 0; layer < kDFlashLayers; ++layer) {
+            const DFlashLayerPlan& layer_plan = source.layers[layer];
+            auto& weights                     = target.layers[layer];
+            weights.input_norm      = artifact::materialized_tensor(draft, layer_plan.input_norm,
+                                                                    NumericFormat::BF16, {DFC::hidden});
+            weights.query_key_value = materialized_weight(draft, layer_plan.query_key_value,
+                                                          DFC::query_size + 2 * DFC::kv_size,
+                                                          DFC::hidden);
+            weights.context_query = row_view(weights.query_key_value, 0, DFC::query_size);
+            weights.context_key   = row_view(weights.query_key_value, DFC::query_size, DFC::kv_size);
+            weights.context_value =
+                row_view(weights.query_key_value, DFC::query_size + DFC::kv_size, DFC::kv_size);
+            weights.query_norm    = artifact::materialized_tensor(draft, layer_plan.query_norm,
+                                                                  NumericFormat::BF16, {DFC::head_dim});
+            weights.key_norm      = artifact::materialized_tensor(draft, layer_plan.key_norm,
+                                                                  NumericFormat::BF16, {DFC::head_dim});
+            weights.attention_output =
+                materialized_weight(draft, layer_plan.attention_output, DFC::hidden, DFC::query_size);
+            weights.post_attention_norm = artifact::materialized_tensor(
+                draft, layer_plan.post_attention_norm, NumericFormat::BF16, {DFC::hidden});
+            weights.gate_up = materialized_weight(draft, layer_plan.mlp.gate_up,
+                                                  2 * DFC::intermediate, DFC::hidden);
+            weights.gate    = row_view(weights.gate_up, 0, DFC::intermediate);
+            weights.up      = row_view(weights.gate_up, DFC::intermediate, DFC::intermediate);
+            weights.down    = materialized_weight(draft, layer_plan.mlp.down, DFC::hidden,
+                                                  DFC::intermediate);
+
+            const auto load_conv = [&](const DFlashConvPlan& conv) {
+                qwen3_6::DFlashConvWeights out{
+                    // Stored (side, tap, channel) row-major, so the channel axis is the
+                    // fastest and comes first in the tensor's extent order.
+                    .base_kernel = artifact::materialized_tensor(
+                        draft, conv.base_kernel, NumericFormat::BF16,
+                        {DFC::hidden, DFC::conv_taps, 2}),
+                    .kernel_projection = materialized_weight(draft, conv.kernel_projection,
+                                                             DFC::conv_projection_rows, DFC::hidden),
+                };
+                // Rows are side-major: the input side first, then the output side.
+                const std::int32_t side_rows = DFC::conv_projection_rows / 2;
+                out.input_side  = row_view(out.kernel_projection, 0, side_rows);
+                out.output_side = row_view(out.kernel_projection, side_rows, side_rows);
+                return out;
+            };
+            weights.attention_conv = load_conv(layer_plan.attention_conv);
+            weights.mlp_conv       = load_conv(layer_plan.mlp_conv);
+        }
+        target.final_norm = artifact::materialized_tensor(draft, source.final_norm,
+                                                          NumericFormat::BF16, {DFC::hidden});
+        target.selector.emplace(qwen3_6::DFlashSelectorWeights{
+            .hidden_projection   = materialized_weight(draft, source.selector.hidden_projection,
+                                                       DFC::selector_rank, DFC::hidden),
+            // Stored [vocab, rank] row-major, which is the [rank, vocab] view the
+            // selector reads: one token's row is contiguous.
+            .predecessor_codebook = artifact::materialized_tensor(
+                draft, source.selector.predecessor_codebook, NumericFormat::BF16,
+                {DFC::selector_rank, DFC::vocab_rows}),
+            .successor_codebook = artifact::materialized_tensor(
+                draft, source.selector.successor_codebook, NumericFormat::BF16,
+                {DFC::selector_rank, DFC::vocab_rows}),
+        });
     }
 }
 

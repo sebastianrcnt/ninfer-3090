@@ -632,10 +632,20 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     if (q4_q5) {
         (void)resolve_q4_q5_conv_plan(min_width, 1);
         (void)resolve_q4_q5_conv_plan(max_width, 1);
-        if (max_width >= 7) {
+        // The fused epilogue covers a subset of the admitted widths; every other width
+        // materialises the projection. Ask the route table which widths those are instead of
+        // restating the catalogue here, so the reservation cannot drift from the schedule.
+        constexpr std::int32_t kLargestFusedWidth = 8;
+        if (max_width > kLargestFusedWidth) {
             largest_materialized_width = max_width;
-        } else if (min_width <= 4 && max_width >= 4) {
-            largest_materialized_width = 4;
+        } else {
+            for (std::int32_t width = max_width; width >= min_width; --width) {
+                if (resolve_q4_q5_conv_plan(width, 1).schedule ==
+                    detail::Q4Q5GdnInputConvScheduleId::Materialized) {
+                    largest_materialized_width = width;
+                    break;
+                }
+            }
         }
     } else {
         (void)resolve_w8_conv_plan(min_width, 1);

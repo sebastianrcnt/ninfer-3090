@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -46,6 +47,18 @@ void validate_options(const EngineOptions& options) {
         break;
     default:
         throw std::invalid_argument("Engine kv_capacity mode is invalid");
+    }
+    const bool dflash = options.speculative.backend == SpeculativeBackend::DFlash;
+    if (dflash && options.draft_artifact_path.empty()) {
+        throw std::invalid_argument("--spec dflash requires a drafter artifact");
+    }
+    if (!options.draft_artifact_path.empty()) {
+        if (!dflash) {
+            throw std::invalid_argument("a drafter artifact requires --spec dflash");
+        }
+        if (options.draft_artifact_path.extension() != ".ninfer") {
+            throw std::invalid_argument("NInfer accepts only .ninfer drafter artifacts");
+        }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
@@ -88,11 +101,29 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
 
     artifact::Binder binder(reader);
-    auto load_plan        = Target::plan_load(binder, options, weights_profile);
+    auto load_plan = Target::plan_load(binder, options, weights_profile);
+
+    // A drafter supplied in its own container is planned before KV capacity is
+    // resolved, so its residency is part of the same budget as the target's.
+    std::optional<artifact::Reader> draft_reader;
+    std::optional<typename Target::DraftLoadPlan> draft_plan;
+    std::size_t draft_capacity_bytes = 0;
+    if constexpr (Target::accepts_draft_artifact) {
+        if (!options.draft_artifact_path.empty()) {
+            draft_reader.emplace(options.draft_artifact_path);
+            artifact::Binder draft_binder(*draft_reader);
+            draft_plan.emplace(Target::plan_draft_load(draft_binder));
+            draft_capacity_bytes = draft_plan->materialization().device_capacity_bytes;
+        }
+    } else if (!options.draft_artifact_path.empty()) {
+        throw std::invalid_argument(
+            "target '" + std::string(target_key) + "' does not accept a drafter artifact");
+    }
+
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
-    const std::size_t preflight_runtime_bytes =
-        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
+    const std::size_t preflight_runtime_bytes = runtime_bytes_after_planned_weights(
+        load_plan.materialization().device_capacity_bytes + draft_capacity_bytes);
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
 
     auto progress     = artifact_progress(options.load_progress);
@@ -100,7 +131,17 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                                               progress.callback ? &progress : nullptr);
     const artifact::MaterializationStats stats = materialized.stats();
 
-    auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
+    std::optional<artifact::MaterializedArtifact> draft_materialized;
+    if constexpr (Target::accepts_draft_artifact) {
+        if (draft_plan.has_value()) {
+            draft_materialized = artifact::materialize(*draft_reader, draft_plan->materialization(),
+                                                       device, nullptr);
+        }
+    }
+
+    auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized),
+                                                std::move(draft_plan),
+                                                std::move(draft_materialized));
     device.synchronize();
     runtime::KvCapacityResolution capacity_resolution =
         runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());

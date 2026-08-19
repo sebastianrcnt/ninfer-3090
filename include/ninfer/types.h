@@ -70,6 +70,10 @@ struct LoadProgress {
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
+    // Optional second container holding a speculative drafter. DFlash 2 drafters
+    // are released and revised independently of the target they draft for, so they
+    // are bound from their own artifact rather than from artifact_path.
+    std::filesystem::path draft_artifact_path;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);

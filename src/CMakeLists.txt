@@ -84,6 +84,8 @@ add_library(ninfer_ops STATIC
   ops/launcher/speculative_round.cu
   ops/launcher/position.cu
   ops/launcher/prepare_ragged_prefix.cu
+  ops/launcher/dflash_conv.cu
+  ops/launcher/dflash_selector.cu
   ops/launcher/prepare_masked_block.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
@@ -167,6 +169,7 @@ add_library(ninfer_ops STATIC
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
   ops/linear_add/q5/q5_linear_add_gemv.cu
+  ops/linear_add/q5/q5_linear_add_small_t_mma.cu
   ops/linear_add/q5/q5_linear_add_plan.cpp
   ops/linear_add/w8/w8_linear_add_gemm_mma.cu
   ops/linear_add/w8/w8_linear_add_gemm_simt.cu
@@ -228,6 +231,8 @@ add_library(ninfer_ops STATIC
   ops/wrapper/speculative_round.cpp
   ops/wrapper/position.cpp
   ops/wrapper/prepare_ragged_prefix.cpp
+  ops/wrapper/dflash_conv.cpp
+  ops/wrapper/dflash_selector.cpp
   ops/wrapper/prepare_masked_block.cpp
   ops/wrapper/residual_add.cpp
   ops/wrapper/rmsnorm.cpp

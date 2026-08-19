@@ -70,6 +70,17 @@ using W8MtpGateUpProjectionGeometry    = W8LinearGeometry<34816, 5120>;
 using W8MtpDownProjectionGeometry      = W8LinearGeometry<5120, 17408>;
 using W835bMtpProjectionGeometry       = W8LinearGeometry<2048, 4096>;
 
+// DFlash 2 drafter projections. Each runs at the speculation block width every round, so
+// the small-T path is the only one that matters for decode: the drafter issues nine of
+// these per layer because its convolutions sit between each projection and its residual
+// add, and none of the shapes matches a registered geometry.
+using W8DFlash2ConvCoefficientGeometry = W8LinearGeometry<640, 5120>;
+using W8DFlash2QueryGeometry           = W8LinearGeometry<4096, 5120>;
+using W8DFlash2KeyValueGeometry        = W8LinearGeometry<1024, 5120>;
+using W8DFlash2AttentionOutputGeometry = W8LinearGeometry<5120, 4096>;
+using W8DFlash2MlpHalfGeometry         = W8LinearGeometry<17408, 5120>;
+using W8DFlash2SelectorGeometry        = W8LinearGeometry<256, 5120>;
+
 inline constexpr std::int32_t kW8VocabularyFirstSmallT         = 1;
 inline constexpr std::int32_t kW8VocabularyLastSmallT          = 33;
 inline constexpr std::int32_t kW8MtpInputFirstSmallT           = 1;
@@ -84,9 +95,29 @@ inline constexpr std::int32_t kW8MtpDownFirstSmallT            = 1;
 inline constexpr std::int32_t kW8MtpDownLastSmallT             = 48;
 inline constexpr std::int32_t kW835bMtpProjectionFirstSmallT   = 1;
 inline constexpr std::int32_t kW835bMtpProjectionLastSmallT    = 48;
+inline constexpr std::int32_t kW8DFlash2FirstSmallT            = 1;
+// The drafter runs at the speculation block width every round, so the tuned range
+// only has to cover it. Wider token counts occur in the prefill context pass and
+// are served by the row-split MMA route.
+inline constexpr std::int32_t kW8DFlash2LastSmallT             = 16;
 
 template <class Geometry, int ActiveTokens>
 struct W8LinearSmallTProductionSchedule;
+
+// One schedule serves every drafter projection: they share k of 5120 or 4096 and differ
+// only in output rows, which the row-per-CTA tiling absorbs.
+template <int ActiveTokens>
+struct W8DFlash2SmallTSchedule {
+    static_assert(ActiveTokens >= kW8DFlash2FirstSmallT);
+    static_assert(ActiveTokens <= kW8DFlash2LastSmallT);
+
+    static constexpr int kTileTokens = ActiveTokens <= 8 ? 8 : 16;
+    static constexpr int kKWarps    = 4;
+    static constexpr int kMinBlocks = 2;
+    static constexpr auto kScaleAccess =
+        ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
+    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess>;
+};
 
 template <int ActiveTokens>
 struct W8LinearSmallTProductionSchedule<W8VocabularyProjectionGeometry, ActiveTokens> {
@@ -220,5 +251,29 @@ struct W8LinearSmallTProductionSchedule<W835bMtpProjectionGeometry, ActiveTokens
     using Type =
         W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess, kActivationCache>;
 };
+
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8DFlash2ConvCoefficientGeometry, ActiveTokens>
+    : W8DFlash2SmallTSchedule<ActiveTokens> {};
+
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8DFlash2QueryGeometry, ActiveTokens>
+    : W8DFlash2SmallTSchedule<ActiveTokens> {};
+
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8DFlash2KeyValueGeometry, ActiveTokens>
+    : W8DFlash2SmallTSchedule<ActiveTokens> {};
+
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8DFlash2AttentionOutputGeometry, ActiveTokens>
+    : W8DFlash2SmallTSchedule<ActiveTokens> {};
+
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8DFlash2MlpHalfGeometry, ActiveTokens>
+    : W8DFlash2SmallTSchedule<ActiveTokens> {};
+
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8DFlash2SelectorGeometry, ActiveTokens>
+    : W8DFlash2SmallTSchedule<ActiveTokens> {};
 
 } // namespace ninfer::ops::detail

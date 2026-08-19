@@ -236,7 +236,8 @@ int run(const Options& options) {
     auto materialized =
         ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
     auto model =
-        target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
+        target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized),
+                                                std::nullopt, std::nullopt);
     auto frontend                      = target::Package::make_frontend(*model);
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
     auto program = target::Package::create_program(*model, std::move(sequence), device);

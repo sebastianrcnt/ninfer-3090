@@ -16,6 +16,11 @@ constexpr int kLastFullT      = 8;
 constexpr int kLastOptimizedT = 20;
 using FullGeometry            = Q4DraftHeadGeometry<5120>;
 using OptimizedGeometry       = Q4DraftHeadGeometry<2048>;
+// Every text layer's gate/up projection. A speculative round verifies a whole block
+// through it, so this is the shape that decides whether the verify amortises its
+// weight read across positions.
+using MlpGateUpGeometry       = Q4SmallTGeometry<34816, 5120>;
+constexpr int kLastMlpT       = 16;
 
 template <class Geometry, int TileTokens, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -23,7 +28,7 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    q4_small_t_mma_kernel<Geometry, TileTokens, ActiveTokens>
+    q4_small_t_mma_kernel<Schedule, Geometry, TileTokens, ActiveTokens>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
@@ -42,6 +47,8 @@ constexpr auto kFullLaunchers = make_launchers<FullGeometry, kFirstSmallT>(
     std::make_index_sequence<kLastFullT - kFirstSmallT + 1>{});
 constexpr auto kOptimizedLaunchers = make_launchers<OptimizedGeometry, kFirstSmallT>(
     std::make_index_sequence<kLastOptimizedT - kFirstSmallT + 1>{});
+constexpr auto kMlpGateUpLaunchers = make_launchers<MlpGateUpGeometry, kFirstSmallT>(
+    std::make_index_sequence<kLastMlpT - kFirstSmallT + 1>{});
 
 template <class Geometry>
 bool matches(const Tensor& x, const Weight& weight) {
@@ -63,6 +70,14 @@ void launch_q4_draft_head_small_t(const Tensor& x, const Weight& weight, Tensor&
         return;
     }
     throw std::invalid_argument("Q4 Linear draft-head small-T: unsupported exact problem");
+}
+
+void launch_q4_mlp_small_t(const Tensor& x, const Weight& weight, Tensor& out,
+                           cudaStream_t stream) {
+    if (!matches<MlpGateUpGeometry>(x, weight) || x.ne[1] > kLastMlpT) {
+        throw std::invalid_argument("Q4 Linear MLP small-T: unsupported exact problem");
+    }
+    kMlpGateUpLaunchers[static_cast<std::size_t>(x.ne[1] - kFirstSmallT)](x, weight, out, stream);
 }
 
 } // namespace ninfer::ops::detail

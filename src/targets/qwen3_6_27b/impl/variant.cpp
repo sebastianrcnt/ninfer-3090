@@ -108,9 +108,22 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     return graph_profiles_through(capacity - 1, ends);
 }
 
-std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
+std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
+                                                                  std::uint32_t draft_window,
                                                                   std::uint32_t) {
-    return {};
+    if (draft_window == 0 || capacity == 0) { return {}; }
+    // A DFlash round submits one block of K+1 positions to both the drafter and the target
+    // verify, so the visible window is E+K+1. Range boundaries are the ordinary decode
+    // split-policy transitions shifted back by the block, so a captured graph spans one
+    // policy rather than straddling two.
+    // One executable is instantiated per profile, and a DFlash 2 round submits many more
+    // nodes than DFlash 1 because its projections are split around the convolutions. Until
+    // those are refused, keep the range count minimal: the ordinary decode split-policy
+    // boundary at 4096 is the one transition worth a separate capture.
+    const std::uint32_t block = draft_window + 1;
+    std::vector<std::uint32_t> ends;
+    if (4096U >= block) { ends.push_back(4096U - block); }
+    return graph_profiles_through(capacity - 1, ends);
 }
 
 void Variant::attention_projection(const Tensor& hidden,

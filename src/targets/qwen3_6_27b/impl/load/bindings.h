@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <variant>
 
@@ -21,6 +22,7 @@ namespace ninfer::targets::qwen3_6_27b::detail {
 inline constexpr std::size_t kTextLayers          = 64;
 inline constexpr std::size_t kFullAttentionLayers = 16;
 inline constexpr std::size_t kGdnLayers           = 48;
+inline constexpr std::size_t kDFlashLayers        = 5;
 
 struct WeightPlan {
     artifact::ObjectHandle object;
@@ -93,6 +95,46 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
+struct DFlashConvPlan {
+    artifact::ObjectHandle base_kernel;
+    WeightPlan kernel_projection;
+};
+
+struct DFlashLayerPlan {
+    artifact::ObjectHandle input_norm;
+    WeightPlan query_key_value;
+    artifact::ObjectHandle query_norm;
+    artifact::ObjectHandle key_norm;
+    WeightPlan attention_output;
+    artifact::ObjectHandle post_attention_norm;
+    MlpPlan mlp;
+    DFlashConvPlan attention_conv;
+    DFlashConvPlan mlp_conv;
+};
+
+struct DFlashSelectorPlan {
+    WeightPlan hidden_projection;
+    artifact::ObjectHandle predecessor_codebook;
+    artifact::ObjectHandle successor_codebook;
+};
+
+struct DFlashPlan {
+    WeightPlan feature_projection;
+    artifact::ObjectHandle context_norm;
+    std::array<DFlashLayerPlan, kDFlashLayers> layers;
+    artifact::ObjectHandle final_norm;
+    DFlashSelectorPlan selector;
+};
+
+struct DraftBindingPlan {
+    DFlashPlan dflash;
+};
+
+struct DraftArtifactLoadPlan {
+    DraftBindingPlan bindings;
+    artifact::MaterializationPlan materialization;
+};
+
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
@@ -119,6 +161,10 @@ struct ArtifactLoadPlan {
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features);
+
+// Bind the DFlash 2 drafter from its own artifact. Every object is resident: a
+// drafter container holds nothing else, so there is no placement choice to make.
+DraftArtifactLoadPlan bind_draft_artifact(artifact::Binder& binder);
 
 struct DensePostMixerPayload {
     Weight gate_up;
@@ -167,7 +213,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
+                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<kDFlashLayers>,
                        kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
@@ -175,7 +221,9 @@ using MtpWeights           = RuntimeModelView::MtpLayer;
 
 class LoadedModelData {
 public:
-    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
+                    const DraftBindingPlan* draft_plan,
+                    std::optional<artifact::MaterializedArtifact> draft_materialized);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
@@ -183,6 +231,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    std::optional<artifact::MaterializedArtifact> draft_backing;
     qwen3_6::FrontendResources frontend;
     RuntimeModelView runtime;
 };
@@ -190,10 +239,18 @@ public:
 class LoadedModel::Impl {
 public:
     Impl(WeightsProfile weights_profile_in, BindingPlan plan,
-         artifact::MaterializedArtifact materialized)
-        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
+         artifact::MaterializedArtifact materialized,
+         std::optional<DraftBindingPlan> draft_plan,
+         std::optional<artifact::MaterializedArtifact> draft_materialized)
+        : weights_profile(weights_profile_in), draft_bindings(std::move(draft_plan)),
+          data(std::move(plan), std::move(materialized),
+               draft_bindings.has_value() ? &*draft_bindings : nullptr,
+               std::move(draft_materialized)) {}
 
     WeightsProfile weights_profile;
+    // Declared before `data`: the drafter plan outlives the constructor call that
+    // reads it through a pointer.
+    std::optional<DraftBindingPlan> draft_bindings;
     LoadedModelData data;
 };
 

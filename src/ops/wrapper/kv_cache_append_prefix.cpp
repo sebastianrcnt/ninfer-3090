@@ -12,7 +12,12 @@ namespace {
 
 constexpr std::int32_t kHeadDim = 128;
 constexpr std::int32_t kKVHeads = 8;
-constexpr std::uint32_t kWindow = 4096;
+// Registered drafter sliding windows: DFlash 1 trains at 4096, DFlash 2 at 2048.
+// The kernels read the window from the cache view, so this stays a validation
+// gate over the windows the project has measured rather than a kernel limit.
+constexpr bool registered_window(std::uint32_t window) noexcept {
+    return window == 2048U || window == 4096U;
+}
 
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* name) {
@@ -95,7 +100,7 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
 
 void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
                            KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || cache.capacity != kWindow ||
+    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || !registered_window(cache.capacity) ||
         cache.padded_capacity < cache.capacity ||
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||

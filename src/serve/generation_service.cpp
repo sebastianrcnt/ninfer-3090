@@ -251,6 +251,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     : options_(std::move(options)) {
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path        = options_.artifact_path;
+    engine_options.draft_artifact_path  = options_.draft_artifact_path;
     engine_options.device               = options_.device;
     engine_options.max_context          = options_.max_context;
     engine_options.kv_capacity          = options_.kv_capacity;

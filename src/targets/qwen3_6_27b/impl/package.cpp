@@ -31,6 +31,24 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->plan.materialization;
 }
 
+class DraftLoadPlan::Impl {
+public:
+    explicit Impl(DraftArtifactLoadPlan draft_plan) : plan(std::move(draft_plan)) {}
+
+    DraftArtifactLoadPlan plan;
+};
+
+DraftLoadPlan::DraftLoadPlan(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+
+DraftLoadPlan::DraftLoadPlan(DraftLoadPlan&&) noexcept            = default;
+DraftLoadPlan& DraftLoadPlan::operator=(DraftLoadPlan&&) noexcept = default;
+DraftLoadPlan::~DraftLoadPlan()                                   = default;
+
+const artifact::MaterializationPlan& DraftLoadPlan::materialization() const {
+    if (impl_ == nullptr) { throw std::logic_error("draft load plan is empty"); }
+    return impl_->plan.materialization;
+}
+
 LoadedModel::LoadedModel(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 LoadedModel::~LoadedModel() = default;
@@ -103,11 +121,27 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
 }
 
+Package::DraftLoadPlan Package::plan_draft_load(artifact::Binder& binder) {
+    return DraftLoadPlan(
+        std::make_unique<DraftLoadPlan::Impl>(detail::bind_draft_artifact(binder)));
+}
+
 std::unique_ptr<Package::LoadedModel>
-Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
+Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized,
+                                std::optional<DraftLoadPlan>&& draft_plan,
+                                std::optional<artifact::MaterializedArtifact>&& draft_materialized) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
+    std::optional<detail::DraftBindingPlan> draft_bindings;
+    if (draft_plan.has_value()) {
+        if (draft_plan->impl_ == nullptr) {
+            throw std::invalid_argument("draft load plan is empty");
+        }
+        draft_bindings = std::move(draft_plan->impl_->plan.bindings);
+        draft_plan->impl_.reset();
+    }
     auto impl = std::make_unique<LoadedModel::Impl>(
-        plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
+        plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized),
+        std::move(draft_bindings), std::move(draft_materialized));
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }

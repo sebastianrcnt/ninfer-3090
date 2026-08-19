@@ -10,22 +10,35 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     switch (k) {
     case 10240:
         if (n == 5120) {
-            if (t <= 48) { return launch_w8_small_t; }
+            if (t <= 16) { return launch_w8_small_t; }
             return launch_w8_mma_r64_c128;
         }
         break;
     case 5120:
         switch (n) {
+        // DFlash 2 drafter: one side of a two-tap convolution's coefficient
+        // projection. Both sides come from row views of one stored weight, so each
+        // GEMM writes a contiguous half.
+        case 640:
+        // DFlash 2 drafter: the gate and up slices of the packed MLP weight.
+        case 17408:
+        // DFlash 2 drafter: the query slice of the packed query/key/value weight.
+        case 4096:
+        // DFlash 2 drafter: the candidate selector's hidden projection.
+        case 256:
+            if (t <= 16) { return launch_w8_small_t; }
+            return launch_w8_mma_r64_c128;
         case 1024:
-            if (t <= 4) { return launch_w8_simt_r8_c4; }
-            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            // Shared with the drafter's key and value slices; W8 at this width is
+            // otherwise unused by the target.
+            if (t <= 16) { return launch_w8_small_t; }
             return launch_w8_mma_r32_c128;
         case 6144:
             if (t <= 4) { return launch_w8_simt_r8_c4; }
             if (t <= 16) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r64_c128;
         case 14336:
-            if (t <= 48) { return launch_w8_small_t; }
+            if (t <= 16) { return launch_w8_small_t; }
             return launch_w8_mma_r64_c128;
         case 34816:
             if (t <= 40) { return launch_w8_small_t; }
@@ -42,17 +55,30 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     case 6144:
         if (n == 5120) {
-            if (t <= 48) { return launch_w8_small_t; }
+            if (t <= 16) { return launch_w8_small_t; }
+            return launch_w8_mma_r64_c128;
+        }
+        break;
+    // DFlash 2 drafter: projection of the five captured target hidden states.
+    case 25600:
+        if (n == 5120) {
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r64_c128;
         }
         break;
     case 17408:
         if (n == 5120) {
-            if (t <= 48) { return launch_w8_small_t; }
+            if (t <= 16) { return launch_w8_small_t; }
             return launch_w8_mma_r64_c128;
         }
         break;
     case 4096:
+        // DFlash 2 drafter: attention output projection.
+        if (n == 5120) {
+            if (t <= 16) { return launch_w8_small_t; }
+            return launch_w8_mma_r64_c128;
+        }
         if (n == 2048) {
             if (t <= 48) { return launch_w8_small_t; }
             if (t <= 56) { return launch_w8_simt_r8_c4; }

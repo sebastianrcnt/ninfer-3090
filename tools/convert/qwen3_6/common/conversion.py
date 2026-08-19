@@ -199,7 +199,7 @@ def build_conversion_report(
     elapsed_seconds: float,
     final_bytes: int,
     device: torch.device,
-    ranking_path: str | Path,
+    ranking_path: str | Path | None = None,
     revision: str | None = None,
     environment_summary: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
@@ -214,7 +214,9 @@ def build_conversion_report(
         "recipe_id": recipe_id,
         "source": {
             "model_path": str(Path(model_dir).resolve()),
-            "ranking_path": str(Path(ranking_path).resolve()),
+            "ranking_path": (
+                None if ranking_path is None else str(Path(ranking_path).resolve())
+            ),
         },
         "arguments": dict(arguments),
         "config_summary": dict(config_summary),

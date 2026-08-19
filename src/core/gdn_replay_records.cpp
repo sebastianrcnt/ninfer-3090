@@ -122,7 +122,8 @@ GdnReplayRecords::GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayo
     validate_layout(layout);
 }
 
-GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int32_t rows) const {
+GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int32_t rows,
+                                             std::int32_t width) const {
     validate_spec(spec);
     if (layer_index < 0 || layer_index >= spec.layers) {
         throw std::out_of_range("GDN replay layer index out of range");
@@ -130,12 +131,18 @@ GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int3
     if (rows <= 0 || rows > spec.record_capacity) {
         throw std::out_of_range("GDN replay active row count out of range");
     }
+    if (width == 0) { width = spec.width; }
+    if (width <= 0 || width > spec.width) {
+        throw std::out_of_range("GDN replay active width out of range");
+    }
     const std::int32_t outer_begin = layer_index * spec.record_capacity;
     return GdnReplayRecordLayer{
-        .conv  = conv.slice(2, outer_begin, rows).view({spec.conv_channels, spec.width, rows}),
-        .key   = key.slice(3, outer_begin, rows),
-        .value = value.slice(3, outer_begin, rows),
-        .gate  = gate.slice(3, outer_begin, rows),
+        .conv  = conv.slice(2, outer_begin, rows)
+                     .slice(1, 0, width)
+                     .view({spec.conv_channels, width, rows}),
+        .key   = key.slice(3, outer_begin, rows).slice(2, 0, width),
+        .value = value.slice(3, outer_begin, rows).slice(2, 0, width),
+        .gate  = gate.slice(3, outer_begin, rows).slice(2, 0, width),
     };
 }
 

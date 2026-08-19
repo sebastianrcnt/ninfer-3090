@@ -79,8 +79,14 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
 }
 
 std::unique_ptr<Package::LoadedModel>
-Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
+Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized,
+                                std::optional<DraftLoadPlan>&& draft_plan,
+                                std::optional<artifact::MaterializedArtifact>&& draft_materialized) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
+    if (draft_plan.has_value() || draft_materialized.has_value()) {
+        throw std::invalid_argument(
+            "target 'qwen3_6_35b_a3b' carries its drafter inside its own artifact");
+    }
     auto impl = std::make_unique<LoadedModel::Impl>(
         plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
     plan.impl_.reset();
