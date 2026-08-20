@@ -6,7 +6,7 @@ Status: complete for the RTX 3090 single-user target. The final lossless DFlash 
 TurboQuant extension status: implemented and serving at 262K capacity.  Mixed Korean, English,
 code, and arithmetic retrieval passes at 31.5K, 97.9K, and 261.9K, and a 512-token DFlash decode
 is stable.  The strict no-throughput-regression contract is still open: at 31.5K, TurboQuant
-prefill is 757.1 tok/s versus the same-harness INT8 result of 839.7 tok/s (-9.8%).  Do not read
+prefill is 715.7 tok/s versus the same-harness INT8 result of 839.7 tok/s (-14.8%).  Do not read
 the completed DFlash 2 status above as completion of this later extension.
 
 Hardware: one RTX 3090 (GA102, `sm_86`, 24 GiB, 936 GB/s), driver 590.48.01, CUDA 13.1.
@@ -382,12 +382,6 @@ The quantized payload itself is 3.5 bits/value; the two FP16 row values account 
 0.09375-bit physical overhead.  Pages remain 64 tokens and are consumed in place.  There is no
 persistent BF16 expansion cache and no extra target-weight read.
 
-Across the target's 16 full-attention layers and four KV heads this is 14.375 KiB/token, or
-3.59375 GiB at 262,144 tokens.  The preceding INT8 layout measured about 35 KiB/token, which would
-be 8.75 GiB at the same capacity.  TurboQuant therefore saves about 5.16 GiB (59%) of target KV
-at 262K and raises the deployed capacity from 98,304 to 262,144 tokens (2.67x), while retaining
-547.94 MiB of post-startup device headroom.
-
 ### GPU paths
 
 * Append performs the signed Hadamard, Polar tree quantization, and QJL residual projection
@@ -402,12 +396,9 @@ at 262K and raises the deployed capacity from 98,304 to 262,144 tokens (2.67x), 
   replacing the second QJL QK contraction with one BF16 Tensor Core MMA.  A scalar, exact
   16-coordinate tree decoder preserves each coordinate's multiplication order without the old
   dynamically indexed `float[16]` local stack; centroid tables reside in device constant memory.
-  The two children required at levels 1--4 are stored as adjacent, exact `(cos, sin)` pairs, so
-  each tree step uses one 64-bit constant lookup instead of two divergent scalar lookups.
   Query-head is the fastest grid axis so the six GQA siblings reuse nearby packed KV cache lines.
   The final T=128 kernel is about 126 us, and a T=4096 one-layer benchmark improved from 14.83 to
-  14.43 ms after the cache-local grid ordering, then to 11.53--11.56 ms after paired centroid
-  loads.  T=8192 similarly improved from 51.14 to 41.51--42.32 ms.
+  14.43 ms after the cache-local grid ordering.
 * INT8/BF16 dispatch and their kernels are unchanged and remain available as fallback modes.
 
 The DFlash 2 artifact has five local-attention layers and no full-attention drafter layer.  The
@@ -460,17 +451,15 @@ with thinking disabled recovered all four values exactly at every measured exten
 
 | Input context | Result | prefill | decode | TTFT | wall | DFlash |
 |---:|---|---:|---:|---:|---:|---:|
-| 31,445 | all four exact | **757.1 tok/s** | **32.3 tok/s** | 41.58 s | 42.75 s | 3.55 tok/round |
-| 97,945 | all four exact | **505.2 tok/s** | **17.2 tok/s** | 194.00 s | 196.21 s | 3.90 tok/round |
+| 31,445 | all four exact | **715.7 tok/s** | **31.7 tok/s** | 43.98 s | 45.18 s | 3.55 tok/round |
+| 97,945 | all four exact | **452.8 tok/s** | **16.2 tok/s** | 216.45 s | 218.79 s | 3.90 tok/round |
 | 261,953 | all four exact | **242.0 tok/s** | **7.3 tok/s** | 1083.00 s | 1088.17 s | 3.25 tok/round |
 
 The same 31.5K harness on INT8 KV measured 839.7 tok/s prefill and 32.8 tok/s decode.  TurboQuant
-therefore remains 9.8% behind in prefill and 1.5% behind in that request's observed decode; the
+therefore remains 14.8% behind in prefill and 3.4% behind in that request's observed decode; the
 latter varies with DFlash acceptance and has also measured 34.6 tok/s on TurboQuant.  Relative to
 the earlier stack-free TurboQuant implementation, Br=128 raises 31.5K prefill from 575.4 to
-757.1 tok/s and 97.9K prefill from 311.4 to 505.2 tok/s.  The 31.5K and 97.9K rows include the
-final paired centroid lookup; the 261.9K row was measured immediately before that exact,
-representation-preserving lookup optimization and is therefore conservative for the final code.
+715.7 tok/s and 97.9K prefill from 311.4 to 452.8 tok/s.
 
 A separate short-context stability request generated exactly 512 tokens and stopped at the output
 limit: 39 input tokens, 128.5 tok/s decode, 7.97 tok/round (99.6% acceptance), and 4.17 s wall time.
@@ -485,7 +474,7 @@ same 128-row reuse and was slightly slower; and reconstruct-then-INT8 QK added 1
 ### Remaining work
 
 The DFlash 2 goal is complete, but the TurboQuant extension is not complete until its 31.5K
-prefill closes the remaining 9.8% gap to INT8 (or that criterion is explicitly renegotiated).
+prefill closes the remaining 14.8% gap to INT8 (or that criterion is explicitly renegotiated).
 The next optimization must reduce packed Polar/QJL prompt-consumer cost; decode, capacity,
 retrieval quality, CUDA Graph stability, and DFlash losslessness are already closed.  Q4-only GDN
 scheduling and extra dequantization magic-number work are known dead ends for the separate
