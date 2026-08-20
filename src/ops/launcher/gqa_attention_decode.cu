@@ -348,7 +348,8 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                                       float scale, PagedKVBatchLayerView cache,
                                       const GqaSmallTInvocation& invocation,
                                       GqaExecutionEnvelope envelope, Tensor& partial_acc,
-                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                      Tensor& partial_m, Tensor& partial_l,
+                                      const __nv_bfloat16* gate, Tensor& out,
                                       cudaStream_t stream) {
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
@@ -437,6 +438,14 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 #undef NINFER_GQA_SMALL_T_DISPATCH
 #undef NINFER_GQA_TQ_ONLY_DISPATCH
 
+    // The gate belongs to whichever kernel writes `out` last, so the inverse transforms below do
+    // not undo it.  TurboQuant forbids rotate_v (see the wrapper's cache-flag validation), so at
+    // most one of these two tails runs and the three cases stay mutually exclusive.  A rotate_v
+    // cache keeps the standalone sigmoid_mul; the wrapper does not offer the gate for that route.
+    const bool gate_on_turboquant             = gate != nullptr && cache.dtype == DType::U8;
+    const __nv_bfloat16* const reduce_gate    = gate_on_turboquant ? nullptr : gate;
+    const __nv_bfloat16* const turboquant_gate = gate_on_turboquant ? gate : nullptr;
+
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = 64;
     const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk),
@@ -453,7 +462,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.valid_columns->data),
                 invocation.width, invocation.full_width, invocation.column_begin,
-                invocation.batch_size, splits, logical_capacity,
+                invocation.batch_size, splits, logical_capacity, reduce_gate,
                 static_cast<__nv_bfloat16*>(out.data));
     };
     const bool masked         = invocation.valid_columns != nullptr;
@@ -487,7 +496,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         const int units = invocation.batch_size * invocation.width * Geometry::QHeads;
         gqa_turboquant_inverse_output_kernel<Geometry><<<units, 256, 0, stream>>>(
             static_cast<__nv_bfloat16*>(out.data), invocation.width, invocation.full_width,
-            invocation.column_begin, invocation.batch_size);
+            invocation.column_begin, invocation.batch_size, turboquant_gate);
         CUDA_CHECK(cudaGetLastError());
     }
     if (cache.rotate_v) {
@@ -509,9 +518,10 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
                                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                                   std::int32_t column_begin, std::int32_t width,
                                   Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                                  Tensor& out, cudaStream_t stream) {
+                                  const Tensor& gate, Tensor& out, cudaStream_t stream) {
     const GqaAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                static_cast<const __nv_bfloat16*>(v.data)};
+    const auto* gate_data = static_cast<const __nv_bfloat16*>(gate.data);
     const GqaSmallTInvocation invocation{
         .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
         .table_rows    = &table_rows,
@@ -523,12 +533,12 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,
                                                         envelope, partial_acc, partial_m, partial_l,
-                                                        out, stream);
+                                                        gate_data, out, stream);
         return;
     }
     gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation,
                                                     envelope, partial_acc, partial_m, partial_l,
-                                                    out, stream);
+                                                    gate_data, out, stream);
 }
 
 void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
@@ -549,12 +559,12 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, batch_cache,
                                                         invocation, envelope, partial_acc,
-                                                        partial_m, partial_l, out, stream);
+                                                        partial_m, partial_l, nullptr, out, stream);
         return;
     }
     gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, batch_cache, invocation,
                                                     envelope, partial_acc, partial_m, partial_l,
-                                                    out, stream);
+                                                    nullptr, out, stream);
 }
 
 } // namespace ninfer::ops::detail

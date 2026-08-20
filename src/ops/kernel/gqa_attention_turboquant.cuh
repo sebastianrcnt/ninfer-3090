@@ -804,7 +804,8 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
 
 template <typename Geometry>
 __launch_bounds__(256) __global__ void gqa_turboquant_inverse_output_kernel(
-    __nv_bfloat16* out, int width, int full_width, int column_begin, int batch_size) {
+    __nv_bfloat16* out, int width, int full_width, int column_begin, int batch_size,
+    const __nv_bfloat16* gate) {
     constexpr unsigned kPolarSeed = 0x504f4c52U;
     const int unit = static_cast<int>(blockIdx.x);
     const int qh   = unit % Geometry::QHeads;
@@ -826,8 +827,9 @@ __launch_bounds__(256) __global__ void gqa_turboquant_inverse_output_kernel(
         values[d] = x;
         __syncthreads();
     }
-    x = x * 0.0625f * tq_random_sign(d, kPolarSeed);
-    out[gqa_q_index<Geometry>(qh, d, column)] = __float2bfloat16(x);
+    x                           = x * 0.0625f * tq_random_sign(d, kPolarSeed);
+    const std::int64_t position = gqa_q_index<Geometry>(qh, d, column);
+    out[position]               = gqa_gated_output(x, gate, position);
 }
 
 } // namespace ninfer::ops
