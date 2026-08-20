@@ -48,6 +48,10 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
     "${CMAKE_CUDA_COMPILER_VERSION}")
 endif()
 
+# Files with many kernel template instantiations (e.g. the GQA attention launchers) leave nvcc's
+# optimizer/ptxas passes single-threaded per translation unit; split them across all host cores.
+add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>)
+
 set(NINFER_BUILD_MEDIA_ACQUIRE OFF)
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
   set(NINFER_BUILD_MEDIA_ACQUIRE ON)
