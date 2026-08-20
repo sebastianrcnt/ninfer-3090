@@ -1,6 +1,7 @@
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/turboquant.h"
 #include "ops/op_tester.h"
 
@@ -584,6 +585,108 @@ int run_decode_benchmark(int context, int query_tokens, int iterations) {
     return 0;
 }
 
+// A/B for the fused sigmoid gate on the path the model actually uses for full-attention decode
+// (A1, which appends the new K/V and then attends).  Both arms run in one process against one
+// cache, so the only difference is whether the gate rides in the attention epilogue or arrives as
+// its own sigmoid_mul launch.
+int run_gate_benchmark(int context, int query_tokens, int iterations) {
+    if (context <= 0 || context > 16384 || query_tokens <= 0 || query_tokens > 8 ||
+        iterations <= 0) {
+        throw std::invalid_argument("TurboQuant gate benchmark arguments out of range");
+    }
+    const int pages = (context + kPagedKVPageSize - 1) / kPagedKVPageSize;
+    std::vector<float> q(static_cast<std::size_t>(kD) * kQH * query_tokens);
+    std::vector<float> k(static_cast<std::size_t>(kD) * kKVH * query_tokens);
+    std::vector<float> v(static_cast<std::size_t>(kD) * kKVH * query_tokens);
+    std::vector<float> gate(static_cast<std::size_t>(kD) * kQH * query_tokens);
+    fill_uniform(q, 8301, -0.3f, 0.3f);
+    fill_uniform(k, 8302, -0.3f, 0.3f);
+    fill_uniform(v, 8303, -1.0f, 1.0f);
+    fill_uniform(gate, 8304, -8.0f, 8.0f);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    round_to_bf16(v);
+    round_to_bf16(gate);
+    std::vector<std::int32_t> query_positions(query_tokens);
+    std::iota(query_positions.begin(), query_positions.end(), context - query_tokens);
+    std::vector<std::int32_t> table(pages);
+    std::iota(table.begin(), table.end(), 0);
+
+    DeviceBuffer dq = to_device_bf16(q);
+    DeviceBuffer dk = to_device_bf16(k);
+    DeviceBuffer dv = to_device_bf16(v);
+    DeviceBuffer dgate = to_device_bf16(gate);
+    DeviceBuffer dqp = to_device(query_positions);
+    DeviceBuffer dt = to_device(table);
+    DeviceBuffer drow = to_device(std::vector<std::int32_t>{0});
+    DeviceBuffer key(static_cast<std::size_t>(ops::turboquant::kKeyBytes) * kPagedKVPageSize *
+                     kKVH * pages);
+    DeviceBuffer value(static_cast<std::size_t>(ops::turboquant::kValueBytes) * kPagedKVPageSize *
+                       kKVH * pages);
+    DeviceBuffer output(static_cast<std::size_t>(kD) * kQH * query_tokens * sizeof(std::uint16_t));
+
+    PagedKVBatchLayerView cache{
+        .k_pages = Tensor(key.p, DType::U8,
+                          {ops::turboquant::kKeyBytes, kPagedKVPageSize, kKVH, pages}),
+        .v_pages = Tensor(value.p, DType::U8,
+                          {ops::turboquant::kValueBytes, kPagedKVPageSize, kKVH, pages}),
+        .block_tables = Tensor(dt.p, DType::I32, {pages, 1}),
+        .head_dim = kD,
+        .num_kv_heads = kKVH,
+        .dtype = DType::U8,
+        .storage = KvCacheStorage::TurboQuant,
+    };
+    Tensor tq(dq.p, DType::BF16, {kD, kQH, query_tokens});
+    Tensor tk(dk.p, DType::BF16, {kD, kKVH, query_tokens});
+    Tensor tv(dv.p, DType::BF16, {kD, kKVH, query_tokens});
+    Tensor tgate(dgate.p, DType::BF16, {kD, kQH, query_tokens});
+    Tensor tqp(dqp.p, DType::I32, {query_tokens});
+    Tensor tr(drow.p, DType::I32, {1});
+    Tensor out(output.p, DType::BF16, {kD, kQH, query_tokens});
+    const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
+                                             static_cast<std::uint32_t>(context)};
+    const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
+        kQH, DType::U8, envelope, 1, query_tokens, query_tokens);
+    DeviceBuffer workspace_storage(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_storage.p, workspace_storage.bytes});
+
+    const auto measure = [&](bool fused) {
+        for (int i = 0; i < 5; ++i) {
+            workspace.reset();
+            ops::gqa_attention(tq, tk, tv, tqp, Tensor{}, tr, 0.0625f, cache, envelope, workspace,
+                               out, nullptr, fused ? tgate : Tensor{});
+            if (!fused) { ops::sigmoid_mul(tgate, out, nullptr); }
+        }
+        cuda_synchronize();
+        cudaEvent_t begin = nullptr, end = nullptr;
+        cuda_check(cudaEventCreate(&begin), "create gate benchmark begin event");
+        cuda_check(cudaEventCreate(&end), "create gate benchmark end event");
+        cuda_check(cudaEventRecord(begin), "record gate benchmark begin");
+        for (int i = 0; i < iterations; ++i) {
+            workspace.reset();
+            ops::gqa_attention(tq, tk, tv, tqp, Tensor{}, tr, 0.0625f, cache, envelope, workspace,
+                               out, nullptr, fused ? tgate : Tensor{});
+            if (!fused) { ops::sigmoid_mul(tgate, out, nullptr); }
+        }
+        cuda_check(cudaEventRecord(end), "record gate benchmark end");
+        cuda_check(cudaEventSynchronize(end), "synchronize gate benchmark end");
+        float milliseconds = 0.0f;
+        cuda_check(cudaEventElapsedTime(&milliseconds, begin, end), "measure gate benchmark");
+        cudaEventDestroy(begin);
+        cudaEventDestroy(end);
+        return static_cast<double>(milliseconds) / iterations;
+    };
+
+    const double separate = measure(false);
+    const double fused = measure(true);
+    std::cout << "TurboQuant gate benchmark context=" << context << " T=" << query_tokens
+              << " iterations=" << iterations << " separate_ms=" << separate
+              << " fused_ms=" << fused << " delta_ms=" << (separate - fused)
+              << " delta_pct=" << (separate > 0.0 ? 100.0 * (separate - fused) / separate : 0.0)
+              << '\n';
+    return 0;
+}
+
 int run_max_logical_address() {
     constexpr int kLogicalPages = 262144 / kPagedKVPageSize;
     constexpr int kPosition = 262144 - 1;
@@ -635,6 +738,80 @@ int run_max_logical_address() {
 
 } // namespace
 
+// The fused sigmoid gate must not change results.  gqa_attention folds `out *= sigmoid(gate)` into
+// whichever kernel writes `out` last, replacing a standalone sigmoid_mul launch per full-attention
+// layer per token.  The fused epilogue deliberately round-trips through BF16 so it reproduces the
+// two roundings the separate kernel performed, which makes exact equality the right contract here:
+// anything looser would let the fusion silently shift model output.
+int run_fused_gate() {
+    std::vector<float> q(static_cast<std::size_t>(kD) * kQH * kT);
+    std::vector<float> k(static_cast<std::size_t>(kD) * kKVH * kT);
+    std::vector<float> v(static_cast<std::size_t>(kD) * kKVH * kT);
+    std::vector<float> gate(static_cast<std::size_t>(kD) * kQH * kT);
+    fill_uniform(q, 8201, -0.3f, 0.3f);
+    fill_uniform(k, 8202, -0.3f, 0.3f);
+    fill_uniform(v, 8203, -1.0f, 1.0f);
+    // Span the sigmoid's saturating tails as well as its linear middle.
+    fill_uniform(gate, 8204, -8.0f, 8.0f);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    round_to_bf16(v);
+    round_to_bf16(gate);
+
+    std::vector<std::int32_t> positions(kT);
+    std::iota(positions.begin(), positions.end(), 0);
+
+    DeviceBuffer dq = to_device_bf16(q);
+    DeviceBuffer dk = to_device_bf16(k);
+    DeviceBuffer dv = to_device_bf16(v);
+    DeviceBuffer dgate = to_device_bf16(gate);
+    DeviceBuffer dp = to_device(positions);
+    DeviceBuffer drow = to_device(std::vector<std::int32_t>{0});
+    const std::size_t out_bytes = static_cast<std::size_t>(kD) * kQH * kT * sizeof(std::uint16_t);
+    DeviceBuffer fused(out_bytes);
+    DeviceBuffer separate(out_bytes);
+
+    Tensor tq(dq.p, DType::BF16, {kD, kQH, kT});
+    Tensor tk(dk.p, DType::BF16, {kD, kKVH, kT});
+    Tensor tv(dv.p, DType::BF16, {kD, kKVH, kT});
+    Tensor tgate(dgate.p, DType::BF16, {kD, kQH, kT});
+    Tensor tp(dp.p, DType::I32, {kT});
+    Tensor tr(drow.p, DType::I32, {1});
+    Tensor tfused(fused.p, DType::BF16, {kD, kQH, kT});
+    Tensor tseparate(separate.p, DType::BF16, {kD, kQH, kT});
+
+    const ops::GqaExecutionEnvelope envelope{1, kT};
+    const std::size_t workspace_bytes =
+        ops::gqa_attention_workspace_capacity_bytes(kQH, DType::U8, envelope, 1, kT, kT);
+    DeviceBuffer workspace_storage(workspace_bytes);
+    WorkspaceArena workspace(DeviceSpan{workspace_storage.p, workspace_storage.bytes});
+
+    // Separate caches so neither run can observe the other's appended rows.
+    Fixture fused_cache;
+    Fixture separate_cache;
+
+    ops::gqa_attention(tq, tk, tv, tp, Tensor{}, tr, 0.0625f, fused_cache.batch_view(), envelope,
+                       workspace, tfused, nullptr, tgate);
+    ops::gqa_attention(tq, tk, tv, tp, Tensor{}, tr, 0.0625f, separate_cache.batch_view(), envelope,
+                       workspace, tseparate, nullptr);
+    ops::sigmoid_mul(tgate, tseparate, nullptr);
+    cuda_synchronize();
+
+    const std::vector<std::uint8_t> fused_bytes = from_device<std::uint8_t>(fused, out_bytes);
+    const std::vector<std::uint8_t> separate_bytes = from_device<std::uint8_t>(separate, out_bytes);
+    if (fused_bytes != separate_bytes) {
+        std::size_t mismatches = 0;
+        for (std::size_t i = 0; i < fused_bytes.size(); ++i) {
+            if (fused_bytes[i] != separate_bytes[i]) { ++mismatches; }
+        }
+        std::cerr << "TurboQuant fused sigmoid gate differs from sigmoid_mul in " << mismatches
+                  << " of " << fused_bytes.size() << " bytes\n";
+        return 1;
+    }
+    std::cout << "TurboQuant fused sigmoid gate matches sigmoid_mul exactly PASS\n";
+    return 0;
+}
+
 int main() {
     try {
         if (cuda_unavailable()) {
@@ -650,6 +827,14 @@ int main() {
                                         iteration_value == nullptr ? 20
                                                                    : std::atoi(iteration_value));
         }
+        if (const char* value = std::getenv("NINFER_TQ_BENCH_GATE_CONTEXT")) {
+            const char* token_value = std::getenv("NINFER_TQ_BENCH_DECODE_T");
+            const char* iteration_value = std::getenv("NINFER_TQ_BENCH_ITERS");
+            return run_gate_benchmark(std::atoi(value),
+                                      token_value == nullptr ? 1 : std::atoi(token_value),
+                                      iteration_value == nullptr ? 200
+                                                                 : std::atoi(iteration_value));
+        }
         if (const char* value = std::getenv("NINFER_TQ_BENCH_T")) {
             const int tokens = std::atoi(value);
             const char* iteration_value = std::getenv("NINFER_TQ_BENCH_ITERS");
@@ -657,7 +842,8 @@ int main() {
                                         iteration_value == nullptr ? 5
                                                                    : std::atoi(iteration_value));
         }
-        const int failures = run() + run_prompt() + run_max_logical_address();
+        const int failures =
+            run() + run_prompt() + run_max_logical_address() + run_fused_gate();
         if (failures != 0) { return 1; }
         std::cout << "turboquant_gqa: PASS\n";
         return 0;

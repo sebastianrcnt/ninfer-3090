@@ -78,8 +78,10 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     }
     CUDA_CHECK(cudaGetLastError());
     if (cache.dtype == DType::U8) {
+        // The prompt route does not fold the sigmoid gate; the wrapper keeps sigmoid_mul for it,
+        // where one extra launch per prompt is not worth a second fusion site.
         gqa_turboquant_inverse_output_kernel<Geometry><<<tokens * Geometry::QHeads, 256, 0, stream>>>(
-            static_cast<__nv_bfloat16*>(out.data), tokens, tokens, 0, 1);
+            static_cast<__nv_bfloat16*>(out.data), tokens, tokens, 0, 1, nullptr);
         CUDA_CHECK(cudaGetLastError());
     }
     if (cache.rotate_v) {

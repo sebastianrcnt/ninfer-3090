@@ -86,11 +86,17 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * q/k/v/positions/valid_columns/kv_table_rows/out, every cache plane/table, and live workspace
  * suballocations are pairwise non-overlapping. The Op overwrites every addressed cache row but
  * owns no persistent frontier, allocation, request identity, or commit authority.
+ * An optional `gate`, contiguous BF16 with the same shape as `out`, applies
+ * `out *= sigmoid(gate)` as part of the Op. The split-KV routes fold it into the kernel that
+ * writes `out` last; every other route defers to sigmoid_mul, so the result is identical either
+ * way, down to the intermediate BF16 rounding the separate kernel performed. An empty tensor
+ * leaves `out` ungated.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                   const Tensor& gate = Tensor{});
 
 /**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is

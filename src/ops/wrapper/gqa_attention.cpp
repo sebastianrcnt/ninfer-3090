@@ -1,6 +1,8 @@
 // ninfer::ops - GQA A1/A2/A3 validation and finite route dispatch.
 #include "ninfer/ops/gqa_attention.h"
 
+#include "ninfer/ops/sigmoid_mul.h"
+
 #include "core/layout.h"
 #include "ops/launcher/gqa_attention.h"
 #include "ninfer/ops/turboquant.h"
@@ -349,8 +351,8 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
 void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                            GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
-                            cudaStream_t stream) {
+                            GqaExecutionEnvelope envelope, WorkspaceArena& workspace,
+                            const Tensor& gate, Tensor& out, cudaStream_t stream) {
     // The INT8 producer partitions every token against a chunk-wide final window.  Executing
     // speculative columns one at a time preserves the exact T=1 softmax partial boundaries and
     // reduction order.  TurboQuant has its own token-specific ranges and keeps the fused chunk.
@@ -365,7 +367,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                              cache, envelope, begin, count, partial.acc, partial.m,
-                                             partial.l, out, stream);
+                                             partial.l, gate, out, stream);
     }
 }
 
@@ -467,7 +469,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                   const Tensor& gate) {
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
@@ -482,6 +485,15 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
 
+    const bool has_gate = gate.data != nullptr;
+    if (has_gate) {
+        if (gate.dtype != DType::BF16) {
+            throw std::invalid_argument("gqa_attention: gate must be BF16");
+        }
+        require_shape(gate, kHeadDim, q.ne[1], width, batch, op, "gate");
+        require_contiguous_nonnull(gate, op, "gate");
+    }
+
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
         cache.dtype == DType::I8 && width > kSmallTChunkTokens && width <= kMaximumVerifyTokens
@@ -489,23 +501,30 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
             : (cache.storage == KvCacheStorage::TurboQuant && width <= 8
                    ? detail::GqaAttentionRoute::SmallT
                    : detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope));
+    // Only the split-KV routes fold the gate into their epilogue.  A rotate_v cache runs an
+    // inverse rotation after them, and the prompt route has its own kernels; both keep the
+    // standalone sigmoid_mul, which costs one launch per prompt rather than per token.
+    const bool fuse_gate = has_gate && !cache.rotate_v &&
+                           (route == detail::GqaAttentionRoute::ChunkedSmallT ||
+                            route == detail::GqaAttentionRoute::SmallT);
+    const Tensor fused_gate = fuse_gate ? gate : Tensor{};
+
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                               envelope, workspace, out, stream);
-        return;
-    }
-    if (route == detail::GqaAttentionRoute::SmallT) {
+                               envelope, workspace, fused_gate, out, stream);
+    } else if (route == detail::GqaAttentionRoute::SmallT) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                              scale, cache, envelope, 0, width, partial.acc,
-                                             partial.m, partial.l, out, stream);
-        return;
+                                             partial.m, partial.l, fused_gate, out, stream);
+    } else {
+        detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                            cache, out, stream);
     }
-    detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, out, stream);
+    if (has_gate && !fuse_gate) { sigmoid_mul(gate, out, stream); }
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,

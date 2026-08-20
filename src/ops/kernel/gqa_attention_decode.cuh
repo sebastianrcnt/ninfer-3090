@@ -26,6 +26,21 @@ extern __device__ unsigned long long g_reduce_rejected_overflow;
 
 inline constexpr int kGqaHeadDim = 256;
 
+// Fused sigmoid gate for the attention epilogue.  Qwen3.6 follows full attention with
+// `a *= sigmoid(gate)`; running it as its own kernel costs one launch and one read+write pass per
+// full-attention layer per token.  Whichever kernel writes `out` last folds it in here instead.
+//
+// The unfused sequence stored the attention output as BF16 and let sigmoid_mul read it back, so it
+// rounded twice.  Round-tripping through BF16 below reproduces that exactly, which keeps the fused
+// path bit-identical to the separate kernel instead of quietly shifting model output.  Skipping the
+// intermediate rounding would be slightly more accurate and is a separate decision.
+__device__ __forceinline__ __nv_bfloat16 gqa_gated_output(float value, const __nv_bfloat16* gate,
+                                                          std::int64_t index) {
+    const __nv_bfloat16 stored = __float2bfloat16(value);
+    if (gate == nullptr) { return stored; }
+    return __float2bfloat16_rn(__bfloat162float(stored) * sigmoid(__bfloat162float(gate[index])));
+}
+
 struct GqaAppendInput {
     static constexpr bool writes_cache = true;
     const __nv_bfloat16* k;
@@ -163,7 +178,8 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, std::int32_t logical_capacity, __nv_bfloat16* out) {
+    std::int32_t split_count, std::int32_t logical_capacity,
+    const __nv_bfloat16* gate, __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -292,8 +308,9 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         if constexpr (Offset) { absolute_column += column_begin; }
         valid = absolute_column < valid_columns[batch];
     }
-    const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    const float value          = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
+    const std::int64_t position = gqa_q_index<Geometry>(q_head, d, output_column);
+    out[position]               = gqa_gated_output(value, gate, position);
 }
 
 } // namespace ninfer::ops
