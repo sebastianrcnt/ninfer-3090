@@ -10,10 +10,16 @@
 #include <mma.h>
 
 #include <cstdint>
+#include <cstdio>
 
 namespace ninfer::ops {
 
 namespace tq = turboquant;
+
+// Defined once in ops/launcher/gqa_attention_decode.cu; -rdc=true resolves the device link.
+extern __device__ unsigned long long g_tq_rejected_positions;
+extern __device__ int                g_tq_max_rejected_position;
+extern __device__ int                g_tq_rejected_logical_capacity;
 
 // Namespace-scope constant tables are essential here.  A function-local constexpr table with
 // runtime indices is materialized on the per-thread stack by ptxas, and the decoder calls these
@@ -562,7 +568,22 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
         qmatrix[index] = __float2bfloat16(0.0f);
     }
     if (d < TokenTile) {
-        const int position = d < valid_tokens ? batch_positions[d] : -1;
+        int position = d < valid_tokens ? batch_positions[d] : -1;
+        // The INT8 and BF16 decode kernels reject a position at or beyond logical_capacity before
+        // deriving their window.  This kernel did not, so an out-of-range position pushed key_end
+        // past the block table and the tile loop below never retired, which the driver reports as
+        // Xid 109 CTX SWITCH TIMEOUT.  Reject it the same way and record that it happened.  The
+        // capacity store races benignly: every thread that reaches it writes the same value.
+        if (position >= logical_capacity) {
+            const unsigned long long seen = atomicAdd(&g_tq_rejected_positions, 1ULL);
+            atomicMax(&g_tq_max_rejected_position, position);
+            g_tq_rejected_logical_capacity = logical_capacity;
+            if (seen < 8ULL) {
+                printf("ninfer: turboquant decode rejected position %d >= logical_capacity %d\n",
+                       position, logical_capacity);
+            }
+            position = -1;
+        }
         query_positions[d] = position;
         const int window = position < 0 ? 0 : position + 1;
         // Every row must use the same split partition it gets during ordinary T=1 decode.

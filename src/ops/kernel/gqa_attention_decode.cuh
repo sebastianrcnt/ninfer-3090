@@ -158,7 +158,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, std::int32_t logical_capacity, __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -194,6 +194,17 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         partial_l += partial_stat_row;
     }
 
+    // Mirror the partial kernels' position guard.  A rejected position means no split published
+    // statistics for this row, so the reducer must not walk the partial slots at all; and a
+    // non-positive window would make gqa_small_t_active_splits report the full launch capacity,
+    // every slot of which would be unwritten.
+    if (reduction_pos < 0 || reduction_pos >= logical_capacity) {
+        const int d = d_start + tid;
+        if (tid < DChunk && d < kGqaHeadDim) {
+            out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
     const int window = reduction_pos + 1;
     const int active_split_count =
         gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);

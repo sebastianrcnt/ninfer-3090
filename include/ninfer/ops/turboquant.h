@@ -21,6 +21,20 @@ inline constexpr std::int32_t kQjlNormOffset     = 130;
 inline constexpr std::int32_t kKeyBytes          = 132;
 inline constexpr std::int32_t kValueBytes        = 98;
 
+// Diagnostics for the decode attention window guard.  The TurboQuant decode kernel used to derive
+// its key range straight from a cache position, so a position at or beyond the logical capacity
+// drove the tile loop past the block table and the kernel never retired (Xid 109 CTX SWITCH
+// TIMEOUT).  It now rejects such a position the way the INT8 and BF16 decode kernels already did;
+// these counters record whether that path is ever reached.
+struct DecodeWindowDiagnostics {
+    std::uint64_t rejected_positions;
+    std::int32_t  max_rejected_position;
+    std::int32_t  logical_capacity;
+};
+
+[[nodiscard]] DecodeWindowDiagnostics decode_window_diagnostics();
+void reset_decode_window_diagnostics();
+
 [[nodiscard]] constexpr std::size_t payload_bytes(std::uint32_t tokens,
                                                   std::uint32_t kv_heads,
                                                   std::uint32_t layers) noexcept {
