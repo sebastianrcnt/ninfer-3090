@@ -20,6 +20,8 @@ namespace tq = turboquant;
 extern __device__ unsigned long long g_tq_rejected_positions;
 extern __device__ int                g_tq_max_rejected_position;
 extern __device__ int                g_tq_rejected_logical_capacity;
+extern __device__ int                g_tq_max_position_seen;
+extern __device__ unsigned long long g_tq_max_position_prints;
 
 // Namespace-scope constant tables are essential here.  A function-local constexpr table with
 // runtime indices is materialized on the per-thread stack by ptxas, and the decoder calls these
@@ -569,6 +571,18 @@ __launch_bounds__(256, 2) __global__ void gqa_turboquant_mma_attention_kernel(
     }
     if (d < TokenTile) {
         int position = d < valid_tokens ? batch_positions[d] : -1;
+        // Report the running maximum only when it grows by a page block, so the plain load
+        // short-circuits almost every launch and the atomic stays off the hot path.  If this
+        // never approaches logical_capacity, an out-of-range position is not merely rare but
+        // never approached, which argues against the window hypothesis directly.
+        if (position >= 0 && position > g_tq_max_position_seen + 4095) {
+            atomicMax(&g_tq_max_position_seen, position);
+            const unsigned long long n = atomicAdd(&g_tq_max_position_prints, 1ULL);
+            if (n < 24ULL) {
+                printf("ninfer: turboquant decode max position now %d (logical_capacity %d)\n",
+                       position, logical_capacity);
+            }
+        }
         // The INT8 and BF16 decode kernels reject a position at or beyond logical_capacity before
         // deriving their window.  This kernel did not, so an out-of-range position pushed key_end
         // past the block table and the tile loop below never retired, which the driver reports as

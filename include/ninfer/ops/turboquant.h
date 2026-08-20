@@ -30,6 +30,15 @@ struct DecodeWindowDiagnostics {
     std::uint64_t rejected_positions;
     std::int32_t  max_rejected_position;
     std::int32_t  logical_capacity;
+    // Highest position the decode kernel ever saw, rejected or not.  If this tracks the served
+    // prompt length and never approaches the capacity bound, an out-of-range position is not
+    // merely rare but never approached, which argues against the window hypothesis directly.
+    std::int32_t  max_position_seen;
+    // Reducer guard: a negative reduction_pos is the padded-token hole that used to make
+    // gqa_small_t_active_splits report the full launch capacity; an out-of-range one mirrors
+    // the partial kernel's rejection.  These separate the two candidate defects.
+    std::uint64_t reducer_rejected_negative;
+    std::uint64_t reducer_rejected_overflow;
 };
 
 [[nodiscard]] DecodeWindowDiagnostics decode_window_diagnostics();

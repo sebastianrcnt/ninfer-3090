@@ -18,6 +18,10 @@ namespace ninfer::ops {
 __device__ unsigned long long g_tq_rejected_positions        = 0ULL;
 __device__ int                g_tq_max_rejected_position     = -1;
 __device__ int                g_tq_rejected_logical_capacity = 0;
+__device__ int                g_tq_max_position_seen         = -1;
+__device__ unsigned long long g_tq_max_position_prints       = 0ULL;
+__device__ unsigned long long g_reduce_rejected_negative     = 0ULL;
+__device__ unsigned long long g_reduce_rejected_overflow     = 0ULL;
 
 } // namespace ninfer::ops
 
@@ -33,7 +37,14 @@ DecodeWindowDiagnostics decode_window_diagnostics() {
                                     sizeof(max_position)));
     CUDA_CHECK(cudaMemcpyFromSymbol(&capacity, ninfer::ops::g_tq_rejected_logical_capacity,
                                     sizeof(capacity)));
-    return DecodeWindowDiagnostics{rejected, max_position, capacity};
+    int max_seen                   = -1;
+    unsigned long long neg         = 0ULL;
+    unsigned long long over        = 0ULL;
+    CUDA_CHECK(cudaMemcpyFromSymbol(&max_seen, ninfer::ops::g_tq_max_position_seen,
+                                    sizeof(max_seen)));
+    CUDA_CHECK(cudaMemcpyFromSymbol(&neg, ninfer::ops::g_reduce_rejected_negative, sizeof(neg)));
+    CUDA_CHECK(cudaMemcpyFromSymbol(&over, ninfer::ops::g_reduce_rejected_overflow, sizeof(over)));
+    return DecodeWindowDiagnostics{rejected, max_position, capacity, max_seen, neg, over};
 }
 
 void reset_decode_window_diagnostics() {
@@ -46,6 +57,15 @@ void reset_decode_window_diagnostics() {
                                   sizeof(max_position)));
     CUDA_CHECK(cudaMemcpyToSymbol(ninfer::ops::g_tq_rejected_logical_capacity, &capacity,
                                   sizeof(capacity)));
+    const int max_seen              = -1;
+    const unsigned long long zero64 = 0ULL;
+    CUDA_CHECK(cudaMemcpyToSymbol(ninfer::ops::g_tq_max_position_seen, &max_seen,
+                                  sizeof(max_seen)));
+    CUDA_CHECK(cudaMemcpyToSymbol(ninfer::ops::g_tq_max_position_prints, &zero64, sizeof(zero64)));
+    CUDA_CHECK(cudaMemcpyToSymbol(ninfer::ops::g_reduce_rejected_negative, &zero64,
+                                  sizeof(zero64)));
+    CUDA_CHECK(cudaMemcpyToSymbol(ninfer::ops::g_reduce_rejected_overflow, &zero64,
+                                  sizeof(zero64)));
 }
 
 } // namespace ninfer::ops::turboquant

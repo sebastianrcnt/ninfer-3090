@@ -16,8 +16,13 @@
 #include <math_constants.h>
 
 #include <cstdint>
+#include <cstdio>
 
 namespace ninfer::ops {
+
+// Defined once in ops/launcher/gqa_attention_decode.cu; -rdc=true resolves the device link.
+extern __device__ unsigned long long g_reduce_rejected_negative;
+extern __device__ unsigned long long g_reduce_rejected_overflow;
 
 inline constexpr int kGqaHeadDim = 256;
 
@@ -199,6 +204,16 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     // non-positive window would make gqa_small_t_active_splits report the full launch capacity,
     // every slot of which would be unwritten.
     if (reduction_pos < 0 || reduction_pos >= logical_capacity) {
+        if (tid == 0) {
+            const bool negative = reduction_pos < 0;
+            const unsigned long long seen =
+                atomicAdd(negative ? &g_reduce_rejected_negative : &g_reduce_rejected_overflow,
+                          1ULL);
+            if (seen < 8ULL) {
+                printf("ninfer: reducer rejected reduction_pos %d (%s, logical_capacity %d)\n",
+                       reduction_pos, negative ? "negative" : "over capacity", logical_capacity);
+            }
+        }
         const int d = d_start + tid;
         if (tid < DChunk && d < kGqaHeadDim) {
             out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(0.0f);
