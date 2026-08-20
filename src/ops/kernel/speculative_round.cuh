@@ -87,7 +87,73 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const __nv_bfloat16* row_logits =
         logits + static_cast<std::int64_t>(row) * cols * physical_rows;
 
+    const bool charset_active = cfg.charset_state != nullptr &&
+                                cfg.token_byte_offsets != nullptr && cfg.token_bytes != nullptr;
+
     if (!(cfg.temperature > 0.0f)) {
+        if (charset_active) {
+            __shared__ float policy_val[kSamplerBlock];
+            __shared__ int policy_idx[kSamplerBlock];
+            __shared__ int policy_done;
+            __shared__ int policy_accepted;
+            __shared__ int policy_tstar;
+            __shared__ std::uint32_t policy_state;
+            if (tid == 0) {
+                policy_done = 0;
+                policy_accepted = 0;
+                policy_tstar = 0;
+                policy_state = *cfg.charset_state;
+            }
+            __syncthreads();
+            for (int i = 0; i <= extent; ++i) {
+                float best = -CUDART_INF_F;
+                int best_idx = INT_MAX;
+                const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
+                const std::uint32_t state = policy_state;
+                for (int v = tid; v < token_domain; v += blockDim.x) {
+                    const float x = sampling_adjusted_logit(__bfloat162float(row_logits[base + v]),
+                                                            v, cfg, nullptr, 0, state, true);
+                    if (sampling_better(x, v, best, best_idx)) { best = x; best_idx = v; }
+                }
+                policy_val[tid] = best;
+                policy_idx[tid] = best_idx;
+                __syncthreads();
+                for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                    if (tid < stride && sampling_better(policy_val[tid + stride],
+                                                        policy_idx[tid + stride], policy_val[tid],
+                                                        policy_idx[tid])) {
+                        policy_val[tid] = policy_val[tid + stride];
+                        policy_idx[tid] = policy_idx[tid + stride];
+                    }
+                    __syncthreads();
+                }
+                if (tid == 0 && !policy_done) {
+                    const int target = policy_idx[0];
+                    if (i < extent && target == row_drafts[i]) {
+                        ++policy_accepted;
+                        policy_state = charset_transition(policy_state, cfg, target);
+                    } else {
+                        policy_tstar = target;
+                        policy_state = charset_transition(policy_state, cfg, target);
+                        policy_done = 1;
+                    }
+                }
+                __syncthreads();
+                if (policy_done) { break; }
+            }
+            if (tid == 0) {
+                for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+                for (int i = 0; i < policy_accepted; ++i) { row_tokens[i] = row_drafts[i]; }
+                row_tokens[policy_accepted] = policy_tstar;
+                const int produced = policy_accepted + 1;
+                licensed_counts[row] = produced;
+                accepted[row] = policy_accepted;
+                anchors[row] = policy_tstar;
+                lengths[row] += produced;
+                *cfg.charset_state = policy_state;
+            }
+            return;
+        }
         if (tid == 0) {
             int a = 0;
             while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
@@ -136,13 +202,23 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         // Column i is only reached when drafts[0..i-1] were all accepted, so the
         // round-local penalty overlay for this column is exactly those i drafts.
         const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
+        std::uint32_t charset_state = 0;
+        const bool has_charset_state = cfg.charset_state != nullptr &&
+                                       cfg.token_byte_offsets != nullptr && cfg.token_bytes != nullptr;
+        if (has_charset_state) {
+            charset_state = *cfg.charset_state;
+            for (int j = 0; j < i; ++j) {
+                charset_state = charset_transition(charset_state, cfg, row_drafts[j]);
+            }
+        }
         if (token_domain <= kSamplerTileItems) {
             sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val, red_idx,
-                                           cand_val, cand_idx, prob, &n_support, row_drafts, i);
+                                           cand_val, cand_idx, prob, &n_support, row_drafts, i,
+                                           charset_state, has_charset_state);
         } else {
             sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg, merge_val,
                                                 merge_idx, cand_val, cand_idx, prob, &n_support,
-                                                row_drafts, i);
+                                                row_drafts, i, charset_state, has_charset_state);
         }
         if (tid == 0 && done_sh == 0) {
             const int L = L_sh;
@@ -194,6 +270,11 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         if (cfg.token_counts != nullptr) {
             for (int i = 0; i < produced; ++i) { atomicAdd(&cfg.token_counts[row_tokens[i]], 1); }
         }
+        if (cfg.charset_state != nullptr) {
+            std::uint32_t state = *cfg.charset_state;
+            for (int i = 0; i < produced; ++i) { state = charset_transition(state, cfg, row_tokens[i]); }
+            *cfg.charset_state = state;
+        }
     }
 }
 
@@ -209,7 +290,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     extent            = extent < 0 ? 0 : (extent > k ? k : extent);
     if (col > extent) { return; }
     const SamplingConfig cfg = configs[row];
-    if (!(cfg.temperature > 0.0f) || token_domain <= kSamplerTileItems) { return; }
+    const bool charset_active = cfg.charset_state != nullptr &&
+                                cfg.token_byte_offsets != nullptr && cfg.token_bytes != nullptr;
+    if ((!(cfg.temperature > 0.0f) && !charset_active) || token_domain <= kSamplerTileItems) { return; }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
         workspace.group_done[col] = 0;
@@ -222,6 +305,13 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const int cap                  = sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
     const std::int32_t* row_drafts = drafts + row * k;
+    std::uint32_t charset_state = 0;
+    const bool has_charset_state = cfg.charset_state != nullptr &&
+                                   cfg.token_byte_offsets != nullptr && cfg.token_bytes != nullptr;
+    if (has_charset_state) {
+        charset_state = *cfg.charset_state;
+        for (int i = 0; i < col; ++i) { charset_state = charset_transition(charset_state, cfg, row_drafts[i]); }
+    }
     const int tile_start           = partial * kSamplerPartialTileItems;
     // Column col's penalty overlay is the first `col` drafts (see accept loop);
     // applying it before top-k selection lets it change the candidate set, not
@@ -231,7 +321,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
             const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
-                                                    row_drafts, col);
+                                                    row_drafts, col, charset_state, has_charset_state);
             keys[item]    = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;
@@ -270,7 +360,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
     if (token_domain <= kSamplerTileItems) { return; }
 
-    if (!(cfg.temperature > 0.0f)) {
+    const bool charset_active = cfg.charset_state != nullptr &&
+                                cfg.token_byte_offsets != nullptr && cfg.token_bytes != nullptr;
+    if (!(cfg.temperature > 0.0f) && !charset_active) {
         if (tid == 0 && col == 0 && group == 0) {
             int a = 0;
             while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
@@ -364,7 +456,12 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     }
     __syncthreads();
 
-    sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
+    if (cfg.temperature > 0.0f) {
+        sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
+    } else {
+        if (tid == 0) { n_support = 1; }
+        __syncthreads();
+    }
 
     if (tid == 0) {
         workspace.dist_support[col] = n_support;
@@ -380,6 +477,16 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             const int L = lengths[row];
             int a       = 0;
             int tstar   = 0;
+            if (!(cfg.temperature > 0.0f)) {
+                for (int i = 0; i <= extent; ++i) {
+                    tstar = workspace.dist_idx[sampling_dist_offset(i, 0)];
+                    if (i < extent && tstar == row_drafts[i]) {
+                        ++a;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
             for (int i = 0; i <= extent; ++i) {
                 const int n            = workspace.dist_support[i];
                 const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
@@ -408,6 +515,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     sampling_uniform(cfg.seed, L + extent + 1, kSamplePurposeSpeculativeBonus, 0u);
                 tstar = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
             }
+            }
             for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
             for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
             row_tokens[a]        = tstar;
@@ -420,6 +528,13 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 for (int i = 0; i < produced; ++i) {
                     atomicAdd(&cfg.token_counts[row_tokens[i]], 1);
                 }
+            }
+            if (cfg.charset_state != nullptr) {
+                std::uint32_t state = *cfg.charset_state;
+                for (int i = 0; i < produced; ++i) {
+                    state = charset_transition(state, cfg, row_tokens[i]);
+                }
+                *cfg.charset_state = state;
             }
             *workspace.speculative_finalize_count = 0;
         }

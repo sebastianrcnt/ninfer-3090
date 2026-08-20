@@ -233,6 +233,8 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
     void reset_memory_peaks() noexcept;
+    void install_charset_policy(std::span<const std::uint32_t> offsets,
+                                std::span<const std::uint8_t> bytes);
 
     const LoadedModelData& model;
     DeviceContext& device;
@@ -268,6 +270,9 @@ public:
     Tensor token_counts;
     Tensor tail_hidden_store;
     Tensor turn_checkpoint_hidden_store;
+    DeviceBuffer charset_offsets;
+    DeviceBuffer charset_bytes;
+    DeviceBuffer charset_states;
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;

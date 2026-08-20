@@ -85,6 +85,7 @@ struct EngineOptions {
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
+    bool block_no_hanja = false; // GPU UTF-8 policy matching llama.cpp no-hanja.gbnf.
     bool use_cuda_graph = true;
     LoadProgress load_progress;
 };

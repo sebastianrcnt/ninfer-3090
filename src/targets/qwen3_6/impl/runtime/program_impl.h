@@ -1356,6 +1356,12 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                         .view({TextConfig::token_domain});
     CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
     request.sampling_host     = config;
+    if (charset_offsets.p != nullptr) {
+        request.sampling_host.token_byte_offsets = static_cast<const std::uint32_t*>(charset_offsets.p);
+        request.sampling_host.token_bytes = static_cast<const std::uint8_t*>(charset_bytes.p);
+        request.sampling_host.charset_state = static_cast<std::uint32_t*>(charset_states.p) + sequence.lane;
+        CUDA_CHECK(cudaMemsetAsync(request.sampling_host.charset_state, 0, sizeof(std::uint32_t), device.stream));
+    }
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -1374,6 +1380,23 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
+}
+
+void ProgramImplCore::install_charset_policy(std::span<const std::uint32_t> offsets,
+                                             std::span<const std::uint8_t> bytes) {
+    if (offsets.size() != static_cast<std::size_t>(TextConfig::token_domain) + 1U ||
+        offsets.empty() || offsets.front() != 0 || offsets.back() != bytes.size()) {
+        throw std::invalid_argument("charset policy token byte table has an invalid shape");
+    }
+    if (!std::is_sorted(offsets.begin(), offsets.end())) {
+        throw std::invalid_argument("charset policy token offsets are not monotonic");
+    }
+    charset_offsets = DeviceBuffer(offsets.size_bytes());
+    charset_bytes = DeviceBuffer(bytes.size());
+    charset_states = DeviceBuffer(static_cast<std::size_t>(max_concurrency) * sizeof(std::uint32_t));
+    charset_offsets.copy_from_host(offsets.data(), offsets.size_bytes());
+    if (!bytes.empty()) charset_bytes.copy_from_host(bytes.data(), bytes.size());
+    charset_states.fill(0);
 }
 
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {

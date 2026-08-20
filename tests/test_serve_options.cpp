@@ -33,6 +33,7 @@ int main() {
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
+    failures += check(!defaults.block_no_hanja, "no-hanja policy is unexpectedly enabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
@@ -66,6 +67,9 @@ int main() {
         parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "turboquant"});
     failures += check(turboquant.kv_cache == ninfer::KvCacheStorage::TurboQuant,
                       "--kv-dtype turboquant did not select PolarQuant/QJL storage");
+    const ServeOptions no_hanja = parse({"ninfer-serve", "model.ninfer", "--no-hanja"});
+    failures += check(no_hanja.block_no_hanja,
+                      "--no-hanja did not enable the GPU charset policy");
 
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
@@ -176,6 +180,8 @@ int main() {
               "serve help omits --preserve-thinking");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
+    failures += check(serve_usage_text("ninfer-serve").find("--no-hanja") != std::string::npos,
+                      "serve help omits --no-hanja");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");

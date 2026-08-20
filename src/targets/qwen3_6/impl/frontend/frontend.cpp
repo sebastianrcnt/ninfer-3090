@@ -938,4 +938,16 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
 
+TokenByteTable Frontend::token_byte_table() const {
+    TokenByteTable out;
+    out.offsets.reserve(kTokenDomain + 1);
+    out.offsets.push_back(0);
+    for (std::size_t id = 0; id < kTokenDomain; ++id) {
+        const std::string bytes = impl_->tokenizer->decode_token_bytes(static_cast<int>(id));
+        out.bytes.insert(out.bytes.end(), bytes.begin(), bytes.end());
+        out.offsets.push_back(static_cast<std::uint32_t>(out.bytes.size()));
+    }
+    return out;
+}
+
 } // namespace ninfer::targets::qwen3_6

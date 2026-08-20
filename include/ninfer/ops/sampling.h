@@ -30,6 +30,12 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    // Optional immutable tokenizer byte table and mutable per-lane UTF-8 state.
+    // Candidates whose bytes would enter the rejected charset-policy state are
+    // excluded before argmax/top-k/probability normalization.
+    const std::uint32_t* token_byte_offsets = nullptr; // device [token_domain + 1]
+    const std::uint8_t* token_bytes          = nullptr; // device packed bytes
+    std::uint32_t* charset_state             = nullptr; // device scalar
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive

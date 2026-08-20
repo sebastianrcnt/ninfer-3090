@@ -176,6 +176,8 @@ public:
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
+    void install_charset_policy(std::span<const std::uint32_t> offsets,
+                                std::span<const std::uint8_t> bytes);
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;

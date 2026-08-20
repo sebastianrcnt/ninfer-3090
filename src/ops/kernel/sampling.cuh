@@ -29,7 +29,7 @@ __launch_bounds__(kSamplerBlock) __global__
         float bv = -CUDART_INF_F;
         int bi   = INT_MAX;
         for (int v = tid; v < token_domain; v += blockDim.x) {
-            const float x = __bfloat162float(logits[base + v]);
+            const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
             if (sampling_better(x, v, bv, bi)) {
                 bv = x;
                 bi = v;
@@ -46,7 +46,10 @@ __launch_bounds__(kSamplerBlock) __global__
             }
             __syncthreads();
         }
-        if (tid == 0) { out[row] = red_idx[0]; }
+        if (tid == 0) {
+            out[row] = red_idx[0];
+            if (cfg.charset_state != nullptr) *cfg.charset_state = charset_transition(*cfg.charset_state, cfg, red_idx[0]);
+        }
         return;
     }
 
@@ -86,6 +89,7 @@ __launch_bounds__(kSamplerBlock) __global__
         }
     }
     out[row] = picked;
+    if (cfg.charset_state != nullptr) *cfg.charset_state = charset_transition(*cfg.charset_state, cfg, picked);
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
@@ -111,7 +115,7 @@ __launch_bounds__(kSamplerBlock) __global__
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
             const float raw = __bfloat162float(logits[base + v]);
-            const float x   = greedy ? raw : sampling_adjusted_logit(raw, v, cfg);
+            const float x   = sampling_adjusted_logit(raw, v, cfg);
             keys[item]      = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;
@@ -272,6 +276,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
             }
         }
         out[col] = picked;
+        if (cfg.charset_state != nullptr) *cfg.charset_state = charset_transition(*cfg.charset_state, cfg, picked);
         if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
         workspace.group_done[col] = 0;
     }

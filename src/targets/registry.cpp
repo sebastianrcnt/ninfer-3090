@@ -153,6 +153,10 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto loaded   = std::make_unique<Loaded>(std::move(model));
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
                                                std::move(sequence_plan), device);
+    if (options.block_no_hanja) {
+        const auto table = instance->loaded->frontend.token_byte_table();
+        instance->program->install_charset_policy(table.offsets, table.bytes);
+    }
     device.synchronize();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
 

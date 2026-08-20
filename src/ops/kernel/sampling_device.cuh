@@ -126,6 +126,49 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
 }
 
+__device__ __forceinline__ bool charset_denied(std::uint32_t c) {
+    return (c == 0x00c7 || c == 0x00d6 || c == 0x00dc || c == 0x00e7 || c == 0x00f6 || c == 0x00fc ||
+            (c >= 0x011e && c <= 0x011f) || (c >= 0x0130 && c <= 0x0131) ||
+            (c >= 0x015e && c <= 0x015f) || (c >= 0x0400 && c <= 0x052f) ||
+            (c >= 0x1c80 && c <= 0x1c8f) || (c >= 0x2de0 && c <= 0x2dff) ||
+            (c >= 0x3040 && c <= 0x30ff) || (c >= 0x31f0 && c <= 0x31ff) ||
+            (c >= 0x3400 && c <= 0x4dbf) || (c >= 0xa640 && c <= 0xa69f) ||
+            (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe2e && c <= 0xfe2f) ||
+            (c >= 0xff65 && c <= 0xff9f) || (c >= 0x4e00 && c <= 0x9fff) ||
+            (c >= 0x1aff0 && c <= 0x1afff) || (c >= 0x1b000 && c <= 0x1b12f) ||
+            (c >= 0x20000 && c <= 0x2a6df) || (c >= 0x2a700 && c <= 0x2ee5f) ||
+            (c >= 0x2f800 && c <= 0x2fa1f) || (c >= 0x30000 && c <= 0x323af));
+}
+
+__device__ __forceinline__ std::uint32_t charset_transition(std::uint32_t state,
+                                                             const SamplingConfig& c, int token) {
+    constexpr std::uint32_t reject = 0xffffffffU;
+    const std::uint32_t begin = c.token_byte_offsets[token];
+    const std::uint32_t end = c.token_byte_offsets[token + 1];
+    for (std::uint32_t i = begin; i < end; ++i) {
+        const std::uint32_t b = c.token_bytes[i];
+        std::uint32_t remaining = state >> 24;
+        const std::uint32_t width = (state >> 22) & 0x3U;
+        std::uint32_t value = state & 0x003fffffU;
+        if (state == reject) return reject;
+        if (remaining == 0) {
+            if (b < 0x80) { state = charset_denied(b) ? reject : 0; continue; }
+            if (b >= 0xc2 && b <= 0xdf) { state = (1U << 24) | (1U << 22) | (b & 0x1fU); continue; }
+            if (b >= 0xe0 && b <= 0xef) { state = (2U << 24) | (2U << 22) | (b & 0x0fU); continue; }
+            if (b >= 0xf0 && b <= 0xf4) { state = (3U << 24) | (3U << 22) | (b & 0x07U); continue; }
+            return reject;
+        }
+        if ((b & 0xc0U) != 0x80U) return reject;
+        value = (value << 6) | (b & 0x3fU);
+        --remaining;
+        if (remaining) { state = (remaining << 24) | (width << 22) | value; continue; }
+        const std::uint32_t minimum = width == 1 ? 0x80U : width == 2 ? 0x800U : 0x10000U;
+        if (value < minimum || value > 0x10ffffU || (value >= 0xd800 && value <= 0xdfff) || charset_denied(value)) return reject;
+        state = 0;
+    }
+    return state;
+}
+
 // Applies presence/frequency penalties to a raw logit. `overlay`/`overlay_len`
 // carry a round-local count overlay: tokens already committed earlier in the
 // current speculative round but not yet flushed to the global `token_counts`. For speculative
@@ -136,7 +179,12 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 // only runs when penalties are active, so it is free on the no-penalty path.
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
-                                                         int overlay_len             = 0) {
+                                                         int overlay_len             = 0,
+                                                         std::uint32_t charset_state = 0,
+                                                         bool has_charset_state      = false) {
+    if (c.charset_state != nullptr && c.token_byte_offsets != nullptr && c.token_bytes != nullptr &&
+        charset_transition(has_charset_state ? charset_state : *c.charset_state, c, v) ==
+            0xffffffffU) return -CUDART_INF_F;
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
@@ -229,13 +277,14 @@ __device__ inline void
 sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab,
                                const SamplingConfig& cfg, float* tile_val, int* tile_idx,
                                float* cand_val, int* cand_idx, float* prob, int* n_support,
-                               const std::int32_t* overlay = nullptr, int overlay_len = 0) {
+                               const std::int32_t* overlay = nullptr, int overlay_len = 0,
+                               std::uint32_t charset_state = 0, bool has_charset_state = false) {
     const int tid = threadIdx.x;
     const int cap = sampling_candidate_cap(cfg, vocab);
     if (tid < kSamplerTileItems) {
         if (tid < vocab) {
             const float x = sampling_adjusted_logit(__bfloat162float(logits[base + tid]), tid, cfg,
-                                                    overlay, overlay_len);
+                                                    overlay, overlay_len, charset_state, has_charset_state);
             tile_val[tid] = x;
             tile_idx[tid] = tid;
         } else {
@@ -259,7 +308,8 @@ sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, s
 __device__ inline void sampling_build_truncated_block_fast(
     const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
     float* merge_val, int* merge_idx, float* cand_val, int* cand_idx, float* prob, int* n_support,
-    const std::int32_t* overlay = nullptr, int overlay_len = 0) {
+    const std::int32_t* overlay = nullptr, int overlay_len = 0,
+    std::uint32_t charset_state = 0, bool has_charset_state = false) {
     const int tid = threadIdx.x;
     const int cap = sampling_candidate_cap(cfg, vocab); // always <= kSamplerFastCandidates
 
@@ -274,7 +324,7 @@ __device__ inline void sampling_build_truncated_block_fast(
     const int fast_cap = cap;
     for (int v = tid; v < vocab; v += blockDim.x) {
         const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg, overlay,
-                                                overlay_len);
+                                                overlay_len, charset_state, has_charset_state);
         sampling_insert_candidate(local_val, local_idx, fast_cap, x, v);
     }
 

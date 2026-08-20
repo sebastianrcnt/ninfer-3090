@@ -234,6 +234,12 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
+void Program<Variant>::install_charset_policy(std::span<const std::uint32_t> offsets,
+                                              std::span<const std::uint8_t> bytes) {
+    impl_->install_charset_policy(offsets, bytes);
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

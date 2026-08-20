@@ -20,6 +20,11 @@ class Frontend;
 class FrontendTestAccess;
 class PreparedPromptAccess;
 
+struct TokenByteTable {
+    std::vector<std::uint32_t> offsets;
+    std::vector<std::uint8_t> bytes;
+};
+
 class PreparedPrompt {
 public:
     PreparedPrompt() noexcept;
@@ -120,6 +125,7 @@ public:
                                                     const StopPolicy& caller_stop,
                                                     const OutputOptions& output = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
+    [[nodiscard]] TokenByteTable token_byte_table() const;
 
 private:
     class Impl;
