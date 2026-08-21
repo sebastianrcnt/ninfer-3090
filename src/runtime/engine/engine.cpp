@@ -336,6 +336,87 @@ RuntimeStats Engine::runtime_stats() const {
         impl_->executor);
 }
 
+namespace {
+
+// The identity a slot file is validated against. weights_id moves with a re-quantized artifact
+// even when model_id does not, so both take part.
+std::string slot_identity(const LoadSummary& load) {
+    return load.model_id + '/' + load.weights_id;
+}
+
+} // namespace
+
+std::uint32_t Engine::slot_count() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> std::uint32_t {
+            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
+                throw std::logic_error("Engine executor is not active");
+            } else {
+                return executor->slot_count();
+            }
+        },
+        impl_->executor);
+}
+
+std::vector<std::uint32_t> Engine::slot_token_counts() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> std::vector<std::uint32_t> {
+            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
+                throw std::logic_error("Engine executor is not active");
+            } else {
+                return executor->slot_token_counts();
+            }
+        },
+        impl_->executor);
+}
+
+SlotTransfer Engine::save_slot(std::uint32_t slot, const std::string& path) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    const std::string identity = slot_identity(impl_->load);
+    return std::visit(
+        [&](auto& executor) -> SlotTransfer {
+            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
+                throw std::logic_error("Engine executor is not active");
+            } else {
+                const runtime::SlotTransferResult result =
+                    executor->save_slot(slot, path, identity);
+                return SlotTransfer{result.tokens, result.bytes};
+            }
+        },
+        impl_->executor);
+}
+
+SlotTransfer Engine::restore_slot(std::uint32_t slot, const std::string& path) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    const std::string identity = slot_identity(impl_->load);
+    return std::visit(
+        [&](auto& executor) -> SlotTransfer {
+            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
+                throw std::logic_error("Engine executor is not active");
+            } else {
+                const runtime::SlotTransferResult result =
+                    executor->restore_slot(slot, path, identity);
+                return SlotTransfer{result.tokens, result.bytes};
+            }
+        },
+        impl_->executor);
+}
+
+std::uint32_t Engine::erase_slot(std::uint32_t slot) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](auto& executor) -> std::uint32_t {
+            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
+                throw std::logic_error("Engine executor is not active");
+            } else {
+                return executor->erase_slot(slot);
+            }
+        },
+        impl_->executor);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(

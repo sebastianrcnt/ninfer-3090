@@ -2,12 +2,15 @@
 
 #include "ninfer/types.h"
 #include "runtime/contract/transient_region.h"
+#include "runtime/slot_file.h"
 #include "runtime/contract/types.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <span>
 
 namespace ninfer {
@@ -171,6 +174,14 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+
+    // Slot persistence for one retained lane. The caller guarantees the lane is idle.
+    [[nodiscard]] ninfer::runtime::SlotTransferResult
+    save_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
+    [[nodiscard]] ninfer::runtime::SlotTransferResult
+    restore_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
+    [[nodiscard]] std::uint32_t erase_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] std::uint32_t retained_token_count_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

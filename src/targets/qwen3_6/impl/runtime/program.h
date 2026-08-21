@@ -10,6 +10,7 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
+#include "runtime/slot_file.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
@@ -227,6 +228,16 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+
+    // Slot persistence. The caller guarantees the lane is not executing; these synchronize the
+    // device stream themselves. save throws when the lane holds nothing retained, restore throws
+    // when the file describes a different model or KV format and leaves the lane cleared.
+    [[nodiscard]] runtime::SlotTransferResult
+    save_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
+    [[nodiscard]] runtime::SlotTransferResult
+    restore_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
+    [[nodiscard]] std::uint32_t erase_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] std::uint32_t retained_token_count_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

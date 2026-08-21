@@ -103,6 +103,20 @@ public:
 
     void warmup();
 
+    // Persisted KV slots. The HTTP layer resolves and validates the filename against
+    // options().slot_save_path before calling these; they take a full path.
+    [[nodiscard]] std::uint32_t slot_count() const { return engine_->slot_count(); }
+    [[nodiscard]] std::vector<std::uint32_t> slot_token_counts() const {
+        return engine_->slot_token_counts();
+    }
+    ninfer::SlotTransfer save_slot(std::uint32_t slot, const std::string& path) {
+        return engine_->save_slot(slot, path);
+    }
+    ninfer::SlotTransfer restore_slot(std::uint32_t slot, const std::string& path) {
+        return engine_->restore_slot(slot, path);
+    }
+    std::uint32_t erase_slot(std::uint32_t slot) { return engine_->erase_slot(slot); }
+
 private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
     [[nodiscard]] HostInputLease

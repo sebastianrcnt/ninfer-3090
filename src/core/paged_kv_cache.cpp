@@ -130,6 +130,60 @@ const Tensor& PagedKVPool::plane(std::size_t index) const { return planes_.at(in
 
 const Tensor& PagedKVPool::block_tables() const noexcept { return block_tables_; }
 
+std::size_t PagedKVPool::page_group_bytes(std::size_t plane_index) const {
+    const Tensor& plane = planes_.at(plane_index);
+    return spec_.plane_order == PagedKVPlaneOrder::PageMajor
+               ? static_cast<std::size_t>(plane.nb[3])
+               : static_cast<std::size_t>(plane.ne[3]) * static_cast<std::size_t>(plane.nb[2]);
+}
+
+namespace {
+
+void transfer_page_group(const Tensor& plane, PagedKVPlaneOrder order, std::int32_t page_id,
+                         void* host, bool to_host, cudaStream_t stream) {
+    auto* base = static_cast<std::byte*>(plane.data);
+    if (order == PagedKVPlaneOrder::PageMajor) {
+        // The group is one contiguous slab: page index is the outermost extent.
+        std::byte* device = base + static_cast<std::size_t>(page_id) *
+                                       static_cast<std::size_t>(plane.nb[3]);
+        const std::size_t bytes = static_cast<std::size_t>(plane.nb[3]);
+        CUDA_CHECK(cudaMemcpyAsync(to_host ? host : static_cast<void*>(device),
+                                   to_host ? static_cast<const void*>(device) : host, bytes,
+                                   to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice,
+                                   stream));
+        return;
+    }
+    // Head major places the page index inside the head extent, so one group is ne[3] chunks of
+    // nb[2] bytes separated by nb[3].  The host image stays packed in that same order.
+    std::byte* device =
+        base + static_cast<std::size_t>(page_id) * static_cast<std::size_t>(plane.nb[2]);
+    const std::size_t width = static_cast<std::size_t>(plane.nb[2]);
+    const std::size_t pitch = static_cast<std::size_t>(plane.nb[3]);
+    const std::size_t rows  = static_cast<std::size_t>(plane.ne[3]);
+    if (to_host) {
+        CUDA_CHECK(cudaMemcpy2DAsync(host, width, device, pitch, width, rows,
+                                     cudaMemcpyDeviceToHost, stream));
+    } else {
+        CUDA_CHECK(cudaMemcpy2DAsync(device, pitch, host, width, width, rows,
+                                     cudaMemcpyHostToDevice, stream));
+    }
+}
+
+} // namespace
+
+void PagedKVPool::read_page_group(std::size_t plane_index, std::int32_t page_id,
+                                  void* host_destination, cudaStream_t stream) const {
+    transfer_page_group(planes_.at(plane_index), spec_.plane_order, page_id, host_destination, true,
+                        stream);
+}
+
+void PagedKVPool::write_page_group(std::size_t plane_index, std::int32_t page_id,
+                                   const void* host_source, cudaStream_t stream) {
+    transfer_page_group(planes_.at(plane_index), spec_.plane_order, page_id,
+                        const_cast<void*>(host_source), false, stream);
+}
+
+
 Tensor PagedKVPool::block_table_row(std::int32_t row) const {
     if (row < 0 || row >= table_row_count()) {
         throw std::out_of_range("Paged KV block-table row out of range");
