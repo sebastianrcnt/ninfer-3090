@@ -209,27 +209,43 @@ bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
 }
 
 template <>
-ninfer::runtime::SlotTransferResult
-Program<Variant>::save_retained_lane(std::uint32_t lane, const std::string& path,
-                                     std::string_view identity) {
-    return impl_->save_retained_lane(lane, path, identity);
+ninfer::runtime::ConversationCheckpoint
+Program<Variant>::capture_retained_lane_checkpoint(std::uint32_t lane,
+                                                   ninfer::runtime::CheckpointKind kind) {
+    return impl_->capture_retained_lane_checkpoint(lane, kind);
 }
 
 template <>
-ninfer::runtime::SlotTransferResult
-Program<Variant>::restore_retained_lane(std::uint32_t lane, const std::string& path,
-                                        std::string_view identity) {
-    return impl_->restore_retained_lane(lane, path, identity);
+std::vector<TokenId> Program<Variant>::retained_lane_ledger_copy(std::uint32_t lane) const {
+    return impl_->retained_lane_ledger_copy(lane);
 }
 
 template <>
-std::uint32_t Program<Variant>::erase_retained_lane(std::uint32_t lane) noexcept {
-    return impl_->erase_retained_lane(lane);
+std::vector<std::byte> Program<Variant>::retained_lane_identity_copy(std::uint32_t lane) const {
+    return impl_->retained_lane_identity_copy(lane);
 }
 
 template <>
-std::uint32_t Program<Variant>::retained_token_count_lane(std::uint32_t lane) const noexcept {
-    return impl_->retained_token_count_lane(lane);
+void Program<Variant>::capture_lane_kv_payload(
+    std::uint32_t lane, ninfer::runtime::ConversationKvPayload& payload, std::size_t& text_parked,
+    std::size_t& backend_parked) {
+    impl_->capture_lane_kv_payload(lane, payload, text_parked, backend_parked);
+}
+
+template <>
+bool Program<Variant>::conversation_checkpoint_matches(
+    const ninfer::runtime::ConversationCheckpoint& checkpoint,
+    const std::vector<TokenId>& ledger, const std::vector<std::byte>& identity_blob,
+    const PreparedPrompt& prompt) const {
+    return impl_->conversation_checkpoint_matches(checkpoint, ledger, identity_blob,
+                                                  PreparedPromptAccess::view(prompt));
+}
+
+template <>
+void Program<Variant>::restore_lane_from_conversation(
+    std::uint32_t lane, const ninfer::runtime::ConversationCheckpoint& checkpoint,
+    std::span<const TokenId> ledger, const ninfer::runtime::ConversationKvPayload& payload) {
+    impl_->restore_lane_from_conversation(lane, checkpoint, ledger, payload);
 }
 
 template <>

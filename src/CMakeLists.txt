@@ -301,6 +301,8 @@ endif()
 add_library(ninfer_engine STATIC
   targets/registry.cpp
   runtime/contract/sampling.cpp
+  runtime/conversation_cache.cpp
+  runtime/conversation_disk.cpp
   runtime/engine/engine.cpp)
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)

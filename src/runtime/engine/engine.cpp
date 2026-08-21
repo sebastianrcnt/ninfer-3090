@@ -131,6 +131,10 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     return impl->wait(sink, cancellation);
 }
 
+namespace {
+std::string slot_identity(const LoadSummary& load);
+}
+
 class Engine::Impl {
 public:
     using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
@@ -139,19 +143,30 @@ public:
         std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(std::move(engine_options)), device(options.device) {
+        : options(std::move(engine_options)), device(options.device),
+          conversations(options.conversation_cache_ram_bytes != 0
+                            ? std::optional<runtime::ConversationCache>(std::in_place)
+                            : std::nullopt) {
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
+        runtime::ConversationCache* cache = conversations ? &*conversations : nullptr;
+        if (!options.conversation_cache_dir.empty() && options.conversation_cache_disk_bytes != 0 &&
+            cache != nullptr) {
+            disk = std::make_unique<runtime::ConversationDiskCache>(
+                options.conversation_cache_dir, options.conversation_cache_disk_bytes,
+                slot_identity(load));
+            disk->scan();
+        }
         executor          = std::visit(
             [&](auto& target_ptr) -> Executor {
                 using Instance =
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                    return std::make_unique<Executor27>(*target_ptr, options);
+                    return std::make_unique<Executor27>(*target_ptr, options, cache, disk.get());
                 } else {
-                    return std::make_unique<Executor35>(*target_ptr, options);
+                    return std::make_unique<Executor35>(*target_ptr, options, cache, disk.get());
                 }
             },
             active);
@@ -169,6 +184,8 @@ public:
     targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
+    std::optional<runtime::ConversationCache> conversations;
+    std::unique_ptr<runtime::ConversationDiskCache> disk;
     Executor executor;
 };
 
@@ -373,72 +390,29 @@ std::string slot_identity(const LoadSummary& load) {
 
 } // namespace
 
-std::uint32_t Engine::slot_count() const {
+std::vector<ConversationSummary> Engine::list_conversations() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
-        [](const auto& executor) -> std::uint32_t {
-            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
+        [](auto& executor) -> std::vector<ConversationSummary> {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("Engine executor is not active");
             } else {
-                return executor->slot_count();
+                return executor->list_conversations();
             }
         },
         impl_->executor);
 }
 
-std::vector<std::uint32_t> Engine::slot_token_counts() const {
+bool Engine::erase_conversation(std::uint64_t id) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
-        [](const auto& executor) -> std::vector<std::uint32_t> {
-            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
+        [id](auto& executor) -> bool {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("Engine executor is not active");
             } else {
-                return executor->slot_token_counts();
-            }
-        },
-        impl_->executor);
-}
-
-SlotTransfer Engine::save_slot(std::uint32_t slot, const std::string& path) {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const std::string identity = slot_identity(impl_->load);
-    return std::visit(
-        [&](auto& executor) -> SlotTransfer {
-            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
-                throw std::logic_error("Engine executor is not active");
-            } else {
-                const runtime::SlotTransferResult result =
-                    executor->save_slot(slot, path, identity);
-                return SlotTransfer{result.tokens, result.bytes};
-            }
-        },
-        impl_->executor);
-}
-
-SlotTransfer Engine::restore_slot(std::uint32_t slot, const std::string& path) {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const std::string identity = slot_identity(impl_->load);
-    return std::visit(
-        [&](auto& executor) -> SlotTransfer {
-            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
-                throw std::logic_error("Engine executor is not active");
-            } else {
-                const runtime::SlotTransferResult result =
-                    executor->restore_slot(slot, path, identity);
-                return SlotTransfer{result.tokens, result.bytes};
-            }
-        },
-        impl_->executor);
-}
-
-std::uint32_t Engine::erase_slot(std::uint32_t slot) {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](auto& executor) -> std::uint32_t {
-            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
-                throw std::logic_error("Engine executor is not active");
-            } else {
-                return executor->erase_slot(slot);
+                return executor->erase_conversation(id);
             }
         },
         impl_->executor);

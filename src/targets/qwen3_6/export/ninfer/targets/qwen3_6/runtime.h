@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 #include "runtime/contract/transient_region.h"
+#include "runtime/conversation_cache.h"
 #include "runtime/slot_file.h"
 #include "runtime/contract/types.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -175,13 +176,24 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
 
-    // Slot persistence for one retained lane. The caller guarantees the lane is idle.
-    [[nodiscard]] ninfer::runtime::SlotTransferResult
-    save_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
-    [[nodiscard]] ninfer::runtime::SlotTransferResult
-    restore_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
-    [[nodiscard]] std::uint32_t erase_retained_lane(std::uint32_t lane) noexcept;
-    [[nodiscard]] std::uint32_t retained_token_count_lane(std::uint32_t lane) const noexcept;
+
+    // Conversation-tiered checkpoint cache. Capture requires an idle retained lane at a
+    // retention boundary; restore rebuilds a lane from host bytes and leaves it retained.
+    [[nodiscard]] ninfer::runtime::ConversationCheckpoint
+    capture_retained_lane_checkpoint(std::uint32_t lane, ninfer::runtime::CheckpointKind kind);
+    [[nodiscard]] std::vector<TokenId> retained_lane_ledger_copy(std::uint32_t lane) const;
+    [[nodiscard]] std::vector<std::byte> retained_lane_identity_copy(std::uint32_t lane) const;
+    void capture_lane_kv_payload(std::uint32_t lane, ninfer::runtime::ConversationKvPayload& payload,
+                                 std::size_t& text_parked, std::size_t& backend_parked);
+    [[nodiscard]] bool
+    conversation_checkpoint_matches(const ninfer::runtime::ConversationCheckpoint& checkpoint,
+                                    const std::vector<TokenId>& ledger,
+                                    const std::vector<std::byte>& identity_blob,
+                                    const PreparedPrompt& prompt) const;
+    void restore_lane_from_conversation(std::uint32_t lane,
+                                        const ninfer::runtime::ConversationCheckpoint& checkpoint,
+                                        std::span<const TokenId> ledger,
+                                        const ninfer::runtime::ConversationKvPayload& payload);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

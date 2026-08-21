@@ -69,7 +69,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
-           "[--max-request-mib N] [--request-log-jsonl FILE] [--slot-save-path DIR] "
+           "[--max-request-mib N] [--request-log-jsonl FILE] "
+           "[--conversation-cache-ram-mib N] [--conversation-cache-dir DIR] "
+           "[--conversation-cache-disk-mib N] [--context-checkpoints N] [--checkpoint-min-step N] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|rk8v4|turboquant] [--spec mtp|dflash --draft-tokens N] "
            "[--draft-artifact FILE] "
@@ -84,8 +86,11 @@ std::string serve_usage_text(const char* argv0) {
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
-           "       --slot-save-path enables POST /slots/{id}?action=save|restore|erase; without\n"
-           "       it save and restore are refused, as in llama.cpp\n"
+           "       --conversation-cache-ram-mib enables the tiered conversation checkpoint cache\n"
+           "       (0 disables); --context-checkpoints caps historical checkpoints per\n"
+           "       conversation (default 32) and --checkpoint-min-step spaces them in tokens\n"
+           "       (default 8192); --conversation-cache-dir with a positive disk budget adds the\n"
+           "       durable restart-recovery tier\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -173,11 +178,31 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
-        } else if (arg == "--slot-save-path") {
-            options.slot_save_path = require_value("--slot-save-path");
-            if (options.slot_save_path.empty()) {
-                throw std::invalid_argument("--slot-save-path must not be empty");
+        } else if (arg == "--conversation-cache-ram-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--conversation-cache-ram-mib"),
+                                                "conversation-cache-ram-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--conversation-cache-ram-mib is out of range");
             }
+            options.conversation_cache_ram_mib = static_cast<std::size_t>(mib);
+        } else if (arg == "--conversation-cache-dir") {
+            options.conversation_cache_dir = require_value("--conversation-cache-dir");
+            if (options.conversation_cache_dir.empty()) {
+                throw std::invalid_argument("--conversation-cache-dir must not be empty");
+            }
+        } else if (arg == "--conversation-cache-disk-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--conversation-cache-disk-mib"),
+                                                "conversation-cache-disk-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--conversation-cache-disk-mib is out of range");
+            }
+            options.conversation_cache_disk_mib = static_cast<std::size_t>(mib);
+        } else if (arg == "--context-checkpoints") {
+            options.context_checkpoints = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--context-checkpoints"), "context-checkpoints"));
+        } else if (arg == "--checkpoint-min-step") {
+            options.checkpoint_min_step = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--checkpoint-min-step"), "checkpoint-min-step"));
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");
@@ -279,6 +304,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
+    }
+    if (!options.conversation_cache_dir.empty() &&
+        (options.conversation_cache_disk_mib == 0 || options.conversation_cache_ram_mib == 0)) {
+        throw std::invalid_argument(
+            "--conversation-cache-dir requires positive --conversation-cache-disk-mib and "
+            "--conversation-cache-ram-mib");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
