@@ -568,7 +568,7 @@ private:
         append_output(request, std::move(published));
         if (decision.finished()) {
             complete_success(request, decision.finish_reason);
-            park_completed_lane(lane, request);
+            park_completed_lane(lane);
             return true;
         }
         return false;
@@ -648,15 +648,15 @@ private:
     // makes restart recovery come from a finished request rather than from a save raced against a
     // still-generating one, and it is what lets another conversation take the lane later without
     // destroying this one.
-    void park_completed_lane(std::uint32_t lane, const std::shared_ptr<Request>& request) noexcept {
+    void park_completed_lane(std::uint32_t lane) noexcept {
         try {
             if (conversations_ == nullptr || !instance_.program->has_retained_lane(lane)) {
                 return;
             }
-            const std::size_t tokens = static_cast<std::size_t>(request->admitted_prompt_tokens) +
-                                       request->generated.size();
-            if (tokens == 0) { return; }
-            capture_lane_into_cache(lane, static_cast<std::uint32_t>(tokens - 1), true);
+            // complete_success() publishes the generated tokens by moving request->generated
+            // before this runs. Ask the Program for the retained boundary instead of deriving a
+            // stale frontier from the now-empty request vector.
+            capture_lane_into_cache(lane, std::nullopt, true);
         } catch (...) {}
     }
 
@@ -731,7 +731,15 @@ private:
         }
         if (!target || lane_entry_[*target] == match->entry) { return false; }
 
-        const std::shared_ptr<const ConversationSnapshot> snapshot = conversations_->acquire(*match);
+        std::shared_ptr<const ConversationSnapshot> snapshot;
+        try {
+            snapshot = conversations_->acquire(*match);
+        } catch (...) {
+            // Durable state is an optimization. A file that disappeared, was truncated, or was
+            // replaced while its catalog was being consumed is a cache miss, never a request
+            // failure.
+            return false;
+        }
         if (snapshot == nullptr) { return false; }
 
         const std::uint32_t lane = *target;
@@ -1329,7 +1337,7 @@ private:
             append_output(request, std::move(published));
             if (terminal[row]) {
                 complete_success(request, finish_reasons[row]);
-                park_completed_lane(lane, request);
+                park_completed_lane(lane);
                 remove_completed_slot(lane);
             } else if (!cancelled[row]) {
                 capture_periodic_boundary(lane, request);

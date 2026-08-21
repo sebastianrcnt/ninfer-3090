@@ -140,7 +140,6 @@ ConversationCache::adopt_disk_catalog(const std::function<void(const std::string
     }
     std::sort(files.begin(), files.end());
 
-    std::uint32_t adopted = 0;
     std::uint32_t refused = 0;
     for (const std::filesystem::path& path : files) {
         std::optional<ConversationFileCatalog> catalog;
@@ -164,8 +163,6 @@ ConversationCache::adopt_disk_catalog(const std::function<void(const std::string
         entry.disk       = std::move(catalog);
         disk_bytes_ += entry.file_bytes;
         entries_.push_back(std::move(entry));
-        ++adopted;
-
         const std::string stem = path.stem().string();
         if (stem.rfind("conv-", 0) == 0) {
             try {
@@ -177,7 +174,8 @@ ConversationCache::adopt_disk_catalog(const std::function<void(const std::string
     if (refused != 0 && report) {
         report("conversation cache refused " + std::to_string(refused) + " snapshot file(s)");
     }
-    return adopted;
+    enforce_disk_budget(0);
+    return static_cast<std::uint32_t>(entries_.size());
 }
 
 std::optional<ConversationCache::Match> ConversationCache::select(const Selector& selector) {
@@ -505,6 +503,7 @@ void ConversationCache::unpin(EntryId entry) {
     Entry* found = find(entry);
     if (found != nullptr && found->pins != 0) { --found->pins; }
     enforce_ram_budget();
+    enforce_disk_budget(0);
 }
 
 void ConversationCache::touch(EntryId entry) {

@@ -177,7 +177,11 @@ ConversationSnapshot read_conversation_payload(const ConversationFileCatalog& ca
     read_exact(in, &header, sizeof(header), "the file header");
     if (std::memcmp(header.magic, kConversationFileMagic, sizeof(header.magic)) != 0 ||
         header.format != kConversationFileFormat ||
-        !(geometry_of(header) == catalog.geometry)) {
+        header.header_bytes != sizeof(ConversationFileHeader) ||
+        !(geometry_of(header) == catalog.geometry) ||
+        header.checkpoint_count != catalog.checkpoints.size() ||
+        header.ledger_bytes != catalog.ledger.size() * sizeof(TokenId) ||
+        header.identity_bytes != catalog.identity.size()) {
         throw std::invalid_argument("conversation snapshot changed under the catalog");
     }
 
@@ -192,11 +196,20 @@ ConversationSnapshot read_conversation_payload(const ConversationFileCatalog& ca
     read_exact(in, snapshot.ledger.data(), header.ledger_bytes, "the token ledger");
     snapshot.identity.resize(static_cast<std::size_t>(header.identity_bytes));
     read_exact(in, snapshot.identity.data(), header.identity_bytes, "the prefix identity");
+    if (snapshot.ledger != catalog.ledger || snapshot.identity != catalog.identity) {
+        throw std::invalid_argument("conversation snapshot changed under the catalog");
+    }
 
     snapshot.checkpoints = catalog.checkpoints;
-    in.seekg(static_cast<std::streamoff>(sizeof(ConversationCheckpointRecord)) *
-                 static_cast<std::streamoff>(header.checkpoint_count),
-             std::ios::cur);
+    for (const ConversationCheckpoint& checkpoint : catalog.checkpoints) {
+        ConversationCheckpointRecord record{};
+        read_exact(in, &record, sizeof(record), "the checkpoint records");
+        if (record.frontier != checkpoint.frontier || record.text_pages != checkpoint.text_pages ||
+            record.backend_pages != checkpoint.backend_pages ||
+            record.turn_boundary != checkpoint.turn_boundary) {
+            throw std::invalid_argument("conversation snapshot changed under the catalog");
+        }
+    }
     for (ConversationCheckpoint& checkpoint : snapshot.checkpoints) {
         checkpoint.state.resize(header.checkpoint_state_bytes);
         read_exact(in, checkpoint.state.data(), header.checkpoint_state_bytes,

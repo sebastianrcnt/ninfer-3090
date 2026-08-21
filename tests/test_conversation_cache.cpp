@@ -298,10 +298,22 @@ int test_file_container(const std::filesystem::path& root) {
                           *loaded.text.planes[1].pages[1] == *snapshot.text.planes[1].pages[1],
                       "the KV payload did not round-trip");
 
+    // The asynchronous writer may replace the path after selection copied its catalog. A reader
+    // must not combine that old checkpoint inventory with the replacement payload.
+    ConversationSnapshot replacement = snapshot;
+    replacement.ledger.front() ^= 1;
+    (void)ninfer::runtime::write_conversation_file(path, replacement);
+    bool refused = false;
+    try {
+        (void)ninfer::runtime::read_conversation_payload(catalog);
+    } catch (const std::exception&) { refused = true; }
+    failures += check(refused, "a replacement payload was combined with a stale catalog");
+    (void)ninfer::runtime::write_conversation_file(path, snapshot);
+
     // A snapshot from another build must be refused rather than reinterpreted.
     ConversationGeometry other = geometry();
     other.model_id_hash ^= 1ULL;
-    bool refused = false;
+    refused = false;
     try {
         (void)ninfer::runtime::read_conversation_catalog(path, other);
     } catch (const std::exception&) { refused = true; }
@@ -363,6 +375,13 @@ int test_disk_tier(const std::filesystem::path& root) {
     }
     failures += check(files == 1, "the completed conversation was not published to disk");
 
+    // Startup must enforce a reduced disk budget immediately, without waiting for a later write.
+    const std::filesystem::path first = dir / "conv-00000000.ninfslot";
+    const std::filesystem::path second = dir / "conv-00000001.ninfslot";
+    std::filesystem::copy_file(first, second,
+                               std::filesystem::copy_options::overwrite_existing);
+    const std::uint64_t one_file_budget = std::filesystem::file_size(first) + 1U;
+
     // A leftover temporary from a crash during replacement must not survive adoption, and the
     // previous valid file must still be adopted.
     { std::ofstream leftover(dir / "conv-0000ffff.ninfslot.partial", std::ios::binary); }
@@ -370,12 +389,14 @@ int test_disk_tier(const std::filesystem::path& root) {
     ConversationCachePolicy options;
     options.ram_budget_bytes    = big_budget();
     options.disk_dir            = dir;
-    options.disk_budget_bytes   = 1ULL << 30;
+    options.disk_budget_bytes   = one_file_budget;
     options.context_checkpoints = 4;
     options.checkpoint_min_step = 0;
     ConversationCache restarted(options, geometry());
     const std::uint32_t adopted = restarted.adopt_disk_catalog(nullptr);
     failures += check(adopted == 1, "the durable catalog was not adopted at startup");
+    failures += check(restarted.stats().disk_bytes <= one_file_budget,
+                      "startup left the durable cache above its byte budget");
     failures += check(restarted.stats().resident_conversations == 0,
                       "startup read a conversation payload it did not need");
     failures += check(!std::filesystem::exists(dir / "conv-0000ffff.ninfslot.partial"),
