@@ -17,6 +17,7 @@ def artifact_summary(artifact: Artifact) -> dict[str, object]:
         "path": str(artifact.path),
         "model_id": artifact.identity.model_id,
         "weights_id": artifact.identity.weights_id,
+        "build_id": artifact.identity.build_id,
         "file_bytes": artifact.file_bytes,
         "payload_offset": artifact.payload_offset,
         "objects": len(artifact.objects),
@@ -51,6 +52,9 @@ def main() -> None:
         else:
             print(f"model_id: {summary['model_id']}")
             print(f"weights_id: {summary['weights_id']}")
+            # Named explicitly when absent: a blank line for an unstamped artifact reads
+            # as a display bug rather than as the reason its slot files are refused.
+            print(f"build_id: {summary['build_id'] or '(unstamped)'}")
             print(
                 f"objects: {summary['objects']} "
                 f"({summary['tensors']} tensors, {summary['resources']} resources)"

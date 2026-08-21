@@ -110,6 +110,11 @@ struct PayloadSpan {
 struct ArtifactIdentity {
     std::string model_id;
     std::string weights_id;
+    // Digest of the payload, stamped after conversion. model_id and weights_id name the
+    // target rather than the checkpoint, so they are equal for two artifacts built from
+    // different weights by one converter; this is the field that separates them. Empty
+    // for artifacts written before the field existed.
+    std::string build_id;
 
     bool operator==(const ArtifactIdentity&) const = default;
 };

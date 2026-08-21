@@ -422,6 +422,8 @@ struct LoadSummary {
     std::string target;
     std::string model_id;
     std::string weights_id;
+    // Payload digest; empty for artifacts stamped before the field existed.
+    std::string build_id;
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;

@@ -164,6 +164,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.target               = std::string(target_key);
     summary.model_id             = identity.model_id;
     summary.weights_id           = identity.weights_id;
+    summary.build_id             = identity.build_id;
     summary.load_seconds         = std::chrono::duration<double>(Clock::now() - load_start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.file_bytes;

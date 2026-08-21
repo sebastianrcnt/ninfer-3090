@@ -76,6 +76,28 @@ void require_members(const Json& value, const std::array<const char*, N>& member
     }
 }
 
+// Identity gained build_id after the format shipped, so its member set is required-plus-optional
+// rather than exact. Unknown members are still refused; only the named optional one is tolerated.
+template <std::size_t N, std::size_t M>
+void require_members_allowing(const Json& value, const std::array<const char*, N>& required,
+                              const std::array<const char*, M>& optional, std::string_view label) {
+    if (!value.is_object() || value.size() < N || value.size() > N + M) {
+        throw ArtifactError(std::string(label) + " has missing or extra members");
+    }
+    for (const char* member : required) {
+        if (!value.contains(member)) {
+            throw ArtifactError(std::string(label) + " has missing or extra members");
+        }
+    }
+    for (const auto& entry : value.items()) {
+        const auto matches = [&entry](const char* member) { return entry.key() == member; };
+        if (std::none_of(required.begin(), required.end(), matches) &&
+            std::none_of(optional.begin(), optional.end(), matches)) {
+            throw ArtifactError(std::string(label) + " has missing or extra members");
+        }
+    }
+}
+
 const std::string& require_string(const Json& value, std::string_view label) {
     if (!value.is_string()) {
         throw ArtifactError(std::string(label) + " must be a nonempty string");
@@ -420,9 +442,14 @@ struct Reader::Impl {
             require_members(directory, root_members, "directory root");
             const auto& raw_identity = directory.at("identity");
             static constexpr std::array identity_members = {"model_id", "weights_id"};
-            require_members(raw_identity, identity_members, "artifact identity");
+            static constexpr std::array identity_optional = {"build_id"};
+            require_members_allowing(raw_identity, identity_members, identity_optional,
+                                     "artifact identity");
             identity.model_id = require_string(raw_identity.at("model_id"), "model_id");
             identity.weights_id = require_string(raw_identity.at("weights_id"), "weights_id");
+            if (raw_identity.contains("build_id")) {
+                identity.build_id = require_string(raw_identity.at("build_id"), "build_id");
+            }
         }
 
         const auto& raw_objects = directory.at("objects");
