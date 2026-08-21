@@ -30,6 +30,13 @@ struct ServeOptions {
     // Directory holding persisted KV slots. Empty disables /slots save and restore, matching
     // llama.cpp, which refuses both unless the server was started with --slot-save-path.
     std::string slot_save_path;
+    // Tiered conversation checkpoint cache. A zero RAM budget (the default) disables automatic
+    // multi-conversation caching; the disk tier requires a positive budget and directory.
+    std::size_t conversation_cache_ram_mib  = 0;
+    std::string conversation_cache_dir;
+    std::size_t conversation_cache_disk_mib = 0;
+    std::uint32_t context_checkpoints       = 32;
+    std::uint32_t checkpoint_min_step       = 8192;
     std::uint32_t max_context              = 8192;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency          = 1;

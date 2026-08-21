@@ -87,6 +87,12 @@ struct EngineOptions {
     bool enable_vision  = false;
     bool block_no_hanja = false; // GPU UTF-8 policy matching llama.cpp no-hanja.gbnf.
     bool use_cuda_graph = true;
+
+    // Tiered conversation checkpoint cache. A zero RAM budget disables automatic
+    // multi-conversation caching; disk options are consumed by the Engine's cache writer.
+    std::size_t conversation_cache_ram_bytes = 0;
+    std::uint32_t context_checkpoints        = 32;
+    std::uint32_t checkpoint_min_step        = 8192;
     LoadProgress load_progress;
 };
 

@@ -10,6 +10,7 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
+#include "runtime/conversation_cache.h"
 #include "runtime/slot_file.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -238,6 +239,25 @@ public:
     restore_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
     [[nodiscard]] std::uint32_t erase_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] std::uint32_t retained_token_count_lane(std::uint32_t lane) const noexcept;
+
+    // Conversation-tiered checkpoint cache. Capture is valid only at a retention boundary on an
+    // idle retained lane; restore rebuilds a cleared-or-retained lane from host bytes and leaves
+    // it retained. The caller holds the executor lock.
+    [[nodiscard]] runtime::ConversationCheckpoint
+    capture_retained_lane_checkpoint(std::uint32_t lane, runtime::CheckpointKind kind);
+    [[nodiscard]] std::vector<TokenId> retained_lane_ledger_copy(std::uint32_t lane) const;
+    [[nodiscard]] std::vector<std::byte> retained_lane_identity_copy(std::uint32_t lane) const;
+    void capture_lane_kv_payload(std::uint32_t lane, runtime::ConversationKvPayload& payload,
+                                 std::size_t& text_parked, std::size_t& backend_parked);
+    [[nodiscard]] bool
+    conversation_checkpoint_matches(const runtime::ConversationCheckpoint& checkpoint,
+                                    const std::vector<TokenId>& ledger,
+                                    const std::vector<std::byte>& identity_blob,
+                                    const PreparedPromptData& prompt) const;
+    void restore_lane_from_conversation(std::uint32_t lane,
+                                        const runtime::ConversationCheckpoint& checkpoint,
+                                        std::span<const TokenId> ledger,
+                                        const runtime::ConversationKvPayload& payload);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

@@ -139,19 +139,23 @@ public:
         std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(std::move(engine_options)), device(options.device) {
+        : options(std::move(engine_options)), device(options.device),
+          conversations(options.conversation_cache_ram_bytes != 0
+                            ? std::optional<runtime::ConversationCache>(std::in_place)
+                            : std::nullopt) {
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
+        runtime::ConversationCache* cache = conversations ? &*conversations : nullptr;
         executor          = std::visit(
             [&](auto& target_ptr) -> Executor {
                 using Instance =
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                    return std::make_unique<Executor27>(*target_ptr, options);
+                    return std::make_unique<Executor27>(*target_ptr, options, cache);
                 } else {
-                    return std::make_unique<Executor35>(*target_ptr, options);
+                    return std::make_unique<Executor35>(*target_ptr, options, cache);
                 }
             },
             active);
@@ -169,6 +173,7 @@ public:
     targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
+    std::optional<runtime::ConversationCache> conversations;
     Executor executor;
 };
 

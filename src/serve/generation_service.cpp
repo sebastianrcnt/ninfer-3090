@@ -273,6 +273,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.block_no_hanja       = options_.block_no_hanja;
     engine_options.use_cuda_graph       = options_.use_cuda_graph;
     engine_options.speculative          = options_.speculative;
+    engine_options.conversation_cache_ram_bytes = options_.conversation_cache_ram_mib << 20;
+    engine_options.context_checkpoints  = options_.context_checkpoints;
+    engine_options.checkpoint_min_step  = options_.checkpoint_min_step;
     engine_options.load_progress        = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
