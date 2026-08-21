@@ -24,14 +24,12 @@ public:
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
 
-    // Vision items carry nested spans and per-frame timestamps that the slot format does not yet
-    // describe. Persisting an identity without them would let a restored prefix compare equal to a
-    // prompt whose images differ, so callers refuse to save such a lane rather than drop the field.
     [[nodiscard]] bool carries_vision() const noexcept { return !vision_items_.empty(); }
 
-    // Round-trips the private representation for slot persistence. serialize() throws when the
-    // identity carries vision items; deserialize() throws on truncated or inconsistent input and
-    // leaves the object cleared.
+    // Round-trips the private representation for slot persistence, vision items included: they
+    // take part in matches(), so an identity persisted without them would let a restored prefix
+    // compare equal to a prompt carrying different media. deserialize() throws on truncated or
+    // inconsistent input and leaves the object cleared.
     [[nodiscard]] std::vector<std::byte> serialize() const;
     void deserialize(std::span<const std::byte> bytes);
 

@@ -16,7 +16,9 @@
 namespace ninfer::runtime {
 
 inline constexpr char kSlotFileMagic[8]        = {'N', 'I', 'N', 'F', 'S', 'L', 'O', 'T'};
-inline constexpr std::uint32_t kSlotFileFormat = 1;
+// v2 describes vision items inside the prefix identity blob; v1 files carried none and are
+// refused rather than read, since a v1 identity for a media prompt cannot exist.
+inline constexpr std::uint32_t kSlotFileFormat = 2;
 
 // Trivially copyable and fixed-size; written verbatim ahead of the payload sections. Field order
 // is part of the format, so append rather than reorder and raise kSlotFileFormat when the meaning
