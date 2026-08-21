@@ -69,7 +69,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
-           "[--max-request-mib N] [--request-log-jsonl FILE] [--slot-save-path DIR] "
+           "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--conversation-cache-ram-mib N] [--conversation-cache-dir DIR] "
            "[--conversation-cache-disk-mib N] [--context-checkpoints N] [--checkpoint-min-step N] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
@@ -86,8 +86,6 @@ std::string serve_usage_text(const char* argv0) {
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
-           "       --slot-save-path enables POST /slots/{id}?action=save|restore|erase; without\n"
-           "       it save and restore are refused, as in llama.cpp\n"
            "       --conversation-cache-ram-mib enables the tiered conversation checkpoint cache\n"
            "       (0 disables); --context-checkpoints caps historical checkpoints per\n"
            "       conversation (default 32) and --checkpoint-min-step spaces them in tokens\n"
@@ -179,11 +177,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
-            }
-        } else if (arg == "--slot-save-path") {
-            options.slot_save_path = require_value("--slot-save-path");
-            if (options.slot_save_path.empty()) {
-                throw std::invalid_argument("--slot-save-path must not be empty");
             }
         } else if (arg == "--conversation-cache-ram-mib") {
             const std::uint64_t mib = parse_u64(require_value("--conversation-cache-ram-mib"),

@@ -89,10 +89,12 @@ struct EngineOptions {
     bool use_cuda_graph = true;
 
     // Tiered conversation checkpoint cache. A zero RAM budget disables automatic
-    // multi-conversation caching; disk options are consumed by the Engine's cache writer.
+    // multi-conversation caching; the durable tier requires a directory and a positive budget.
     std::size_t conversation_cache_ram_bytes = 0;
     std::uint32_t context_checkpoints        = 32;
     std::uint32_t checkpoint_min_step        = 8192;
+    std::filesystem::path conversation_cache_dir;
+    std::size_t conversation_cache_disk_bytes = 0;
     LoadProgress load_progress;
 };
 

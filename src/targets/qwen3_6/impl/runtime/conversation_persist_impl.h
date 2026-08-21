@@ -10,8 +10,8 @@
 // mtp_draft_count == 0. The caller holds the executor lock; these calls synchronize the device
 // stream themselves.
 //
-// Included after slot_persist_impl.h in the same translation unit and shares its anonymous-
-// namespace helpers (linear_slot_view, kLinearConvSlotDim, kLinearRecurrentSlotDim).
+// A lane's linear-attention state slice per layer carries the slot extent on a rank-dependent
+// dimension: conv is {channels, width, slots}, recurrent is {key_dim, value_dim, heads, slots}.
 
 #include "runtime/conversation_cache.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
@@ -26,6 +26,13 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 namespace {
+
+constexpr int kLinearConvSlotDim      = 2;
+constexpr int kLinearRecurrentSlotDim = 3;
+
+Tensor linear_slot_view(const Tensor& pool, std::int32_t slot, int slot_dim) {
+    return pool.slice(slot_dim, slot, 1);
+}
 
 std::vector<std::byte> device_bytes(const Tensor& tensor) {
     const std::size_t bytes = tensor.bytes();
@@ -117,7 +124,8 @@ void ProgramImplCore::capture_lane_kv_payload(std::uint32_t lane,
 
     // Pages are immutable once written, so a re-park copies only pages past the parked mark.
     const auto stream_pages = [&](PagedKVPool& pool, const PagedKVAllocation& allocation,
-                                  std::vector<std::vector<std::vector<std::byte>>>& planes,
+                                  std::vector<std::vector<runtime::ConversationKvPayload::PageBytes>>&
+                                      planes,
                                   std::size_t& parked_pages) {
         planes.clear();
         planes.resize(pool.plane_count());
@@ -126,9 +134,11 @@ void ProgramImplCore::capture_lane_kv_payload(std::uint32_t lane,
             planes[plane].resize(pages);
             const std::size_t begin = std::min(parked_pages, pages);
             for (std::size_t p = begin; p < pages; ++p) {
-                planes[plane][p].resize(pool.page_group_bytes(plane));
-                pool.read_page_group(plane, allocation.page_ids()[p],
-                                     planes[plane][p].data(), device.stream);
+                auto buffer = std::make_shared<std::vector<std::byte>>(
+                    pool.page_group_bytes(plane));
+                pool.read_page_group(plane, allocation.page_ids()[p], buffer->data(),
+                                     device.stream);
+                planes[plane][p] = std::move(buffer);
             }
         }
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
@@ -196,11 +206,12 @@ void ProgramImplCore::restore_lane_from_conversation(
             throw std::invalid_argument("checkpoint identity length disagrees with its ledger");
         }
 
-        const auto plane_pages = [](const std::vector<std::vector<std::vector<std::byte>>>& planes) {
-            return planes.empty()
-                       ? std::uint32_t{0}
-                       : static_cast<std::uint32_t>(planes.front().size());
-        };
+        const auto plane_pages =
+            [](const std::vector<std::vector<runtime::ConversationKvPayload::PageBytes>>& planes) {
+                return planes.empty()
+                           ? std::uint32_t{0}
+                           : static_cast<std::uint32_t>(planes.front().size());
+            };
         const std::uint32_t text_pages    = plane_pages(payload.text_pages);
         const std::uint32_t backend_pages = payload.has_backend_kv
                                                 ? plane_pages(payload.backend_pages)
@@ -215,21 +226,22 @@ void ProgramImplCore::restore_lane_from_conversation(
         write_device_bytes(sequence.turn_checkpoint_hidden, checkpoint.turn_checkpoint_hidden,
                            "turn checkpoint hidden state");
 
-        const auto load_kv = [&](PagedKVPool& pool, const PagedKVAllocation& allocation,
-                                 const std::vector<std::vector<std::vector<std::byte>>>& planes,
-                                 const char* what) {
-            for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
-                const auto& pages = planes.at(plane);
-                if (pages.size() != allocation.page_ids().size()) {
-                    throw std::invalid_argument(std::string("conversation ") + what +
-                                                " page count disagrees with the reservation");
+        const auto load_kv =
+            [&](PagedKVPool& pool, const PagedKVAllocation& allocation,
+                const std::vector<std::vector<runtime::ConversationKvPayload::PageBytes>>& planes,
+                const char* what) {
+                for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+                    const auto& pages = planes.at(plane);
+                    if (pages.size() != allocation.page_ids().size()) {
+                        throw std::invalid_argument(std::string("conversation ") + what +
+                                                    " page count disagrees with the reservation");
+                    }
+                    for (std::size_t p = 0; p < pages.size(); ++p) {
+                        pool.write_page_group(plane, allocation.page_ids()[p], pages[p]->data(),
+                                              device.stream);
+                    }
                 }
-                for (std::size_t p = 0; p < pages.size(); ++p) {
-                    pool.write_page_group(plane, allocation.page_ids()[p], pages[p].data(),
-                                          device.stream);
-                }
-            }
-        };
+            };
         load_kv(text_pool, sequence.kv->text, payload.text_pages, "text KV payload");
         if (sequence.kv->backend && backend != nullptr) {
             load_kv(backend->pool(), *sequence.kv->backend, payload.backend_pages,

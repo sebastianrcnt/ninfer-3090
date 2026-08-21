@@ -60,11 +60,13 @@ private:
     friend class Engine;
 };
 
-// Byte and token totals for one slot transfer; the HTTP layer renders these as llama.cpp's
-// n_saved/n_written and n_restored/n_read.
-struct SlotTransfer {
+// One cached conversation in the tiered checkpoint cache. `tokens` is its ledger length;
+// `frontier` is the newest restorable turn boundary.
+struct ConversationSummary {
+    std::uint64_t id = 0;
+    std::string name;
     std::uint32_t tokens = 0;
-    std::uint64_t bytes  = 0;
+    std::uint32_t frontier = 0;
 };
 
 class Engine {
@@ -105,14 +107,11 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const;
     void reset_memory_peaks() noexcept;
 
-    // Persisted KV slots, matching llama.cpp's /slots surface. A slot is one request lane; the
-    // lane must not be serving a request, and restore refuses a file written for another model,
-    // KV format, or speculative backend rather than reinterpreting its bytes.
-    [[nodiscard]] std::uint32_t slot_count() const;
-    [[nodiscard]] std::vector<std::uint32_t> slot_token_counts() const;
-    SlotTransfer save_slot(std::uint32_t slot, const std::string& path);
-    SlotTransfer restore_slot(std::uint32_t slot, const std::string& path);
-    std::uint32_t erase_slot(std::uint32_t slot);
+    // Tiered conversation checkpoint cache. A conversation survives its request in host RAM and,
+    // when configured, on disk; admission restores the longest exact-prefix checkpoint
+    // automatically. Erasing drops both tiers and any resident lane state for that conversation.
+    [[nodiscard]] std::vector<ConversationSummary> list_conversations() const;
+    bool erase_conversation(std::uint64_t id);
 
 private:
     class Impl;

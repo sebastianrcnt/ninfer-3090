@@ -53,6 +53,26 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `GET /conversations` | cached conversations in the tiered checkpoint cache |
+| `DELETE /conversations/{id}` | drop one conversation from RAM, disk, and any retained lane |
+
+## Tiered conversation cache
+
+A lane is an execution resource; a conversation is the cached unit. With
+`--conversation-cache-ram-mib N` (N > 0), every completed request parks its retained state into a
+bounded host-RAM catalog: the newest turn boundary always survives, older boundaries are kept up to
+`--context-checkpoints` per conversation and spaced at least `--checkpoint-min-step` tokens apart,
+and a global LRU enforces the byte budget across all conversations. When a request matches no
+resident prefix, admission consults the catalog and restores the longest exact-prefix checkpoint —
+matched by token ledger plus prepared-prefix identity including media digests — so alternating
+conversations resume without falling back to token zero. With `--conversation-cache-dir` and a
+positive `--conversation-cache-disk-mib`, completed snapshots are also written asynchronously to
+`NINFSLOT` v4 files (atomic rename, previous snapshot preserved) and are lazily loaded on first
+match after startup.
+
+`GET /conversations` lists `{id, name, tokens, frontier}` per cached conversation.
+`DELETE /conversations/{id}` erases it from RAM, the durable tier, and any retained lane holding
+it.
 
 ## OpenAI Chat Completions
 
@@ -451,6 +471,11 @@ curl http://127.0.0.1:8080/v1/models \
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
+| `--conversation-cache-ram-mib N` | global host-RAM budget of the tiered conversation checkpoint cache; `0` disables it | `0` |
+| `--conversation-cache-dir DIR` | durable snapshot directory; requires positive RAM and disk budgets | unset |
+| `--conversation-cache-disk-mib N` | global durable-snapshot budget | `0` |
+| `--context-checkpoints N` | historical checkpoints kept per conversation | `32` |
+| `--checkpoint-min-step N` | minimum token spacing between retained boundaries | `8192` |
 
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
 Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for

@@ -28,7 +28,17 @@ const ConversationRecord* ConversationCache::find(ConversationId id) const {
     return nullptr;
 }
 
-void ConversationCache::touch(ConversationRecord& record) { record.last_touch_tick = ++tick_; }
+void ConversationCache::touch(ConversationRecord& record) {
+    for (auto it = records_.begin(); it != records_.end(); ++it) {
+        if (&*it == &record) {
+            record.last_touch_tick = ++tick_;
+            // Keep the list in least-recently-touched-first order so eviction can pop the
+            // front without a scan.
+            records_.splice(records_.end(), records_, it);
+            return;
+        }
+    }
+}
 
 std::size_t ConversationCache::prune_redundant_checkpoints(ConversationRecord& record) {
     const auto spacing = options_.min_checkpoint_spacing_tokens;

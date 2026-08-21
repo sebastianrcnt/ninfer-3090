@@ -66,19 +66,23 @@ struct ConversationCheckpoint {
 
 // The shared packed KV pages of one conversation, plane-major then page-order, exactly as
 // PagedKVPool::read_page_group produces them. Pages are immutable once written, so a checkpoint
-// at frontier F is valid while the payload covers at least F tokens' worth of pages.
+// at frontier F is valid while the payload covers at least F tokens' worth of pages. Pages are
+// shared-immutable: a re-park installs fresh buffers rather than mutating existing ones, which
+// lets the disk writer serialize a snapshot without blocking admission.
 struct ConversationKvPayload {
+    using PageBytes = std::shared_ptr<const std::vector<std::byte>>;
+
     std::uint32_t text_plane_count = 0;
     std::uint32_t backend_plane_count = 0;
     bool has_backend_kv = false;
     std::uint64_t text_page_group_bytes = 0;
     std::uint64_t backend_page_group_bytes = 0;
-    // Plane-major page groups: text_pages[plane][page] is one page group's bytes.
-    std::vector<std::vector<std::vector<std::byte>>> text_pages;
-    std::vector<std::vector<std::vector<std::byte>>> backend_pages;
+    // Plane-major page groups: text_pages[plane][page].
+    std::vector<std::vector<PageBytes>> text_pages;
+    std::vector<std::vector<PageBytes>> backend_pages;
 
     [[nodiscard]] std::size_t page_count() const noexcept {
-        const auto count = [](const std::vector<std::vector<std::vector<std::byte>>>& planes) {
+        const auto count = [](const std::vector<std::vector<PageBytes>>& planes) {
             return planes.empty() ? 0 : planes.front().size();
         };
         return count(text_pages) + (has_backend_kv ? count(backend_pages) : 0);
@@ -87,10 +91,10 @@ struct ConversationKvPayload {
     [[nodiscard]] std::size_t payload_bytes() const noexcept {
         std::size_t total = 0;
         for (const auto& plane : text_pages) {
-            for (const auto& page : plane) { total += page.size(); }
+            for (const auto& page : plane) { total += page->size(); }
         }
         for (const auto& plane : backend_pages) {
-            for (const auto& page : plane) { total += page.size(); }
+            for (const auto& page : plane) { total += page->size(); }
         }
         return total;
     }

@@ -5,6 +5,7 @@
 #include "ninfer/types.h"
 #include "core/paged_kv_cache.h"
 #include "runtime/conversation_cache.h"
+#include "runtime/conversation_disk.h"
 #include "runtime/slot_file.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
@@ -47,13 +48,13 @@ public:
     using Clock    = std::chrono::steady_clock;
 
     ConcurrentExecutor(Instance& instance, const EngineOptions& options,
-                       ConversationCache* conversations)
+                       ConversationCache* conversations, ConversationDiskCache* disk)
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           admission_capacity_(instance.program->admission_capacity()),
-          conversations_(conversations) {
+          conversations_(conversations), disk_(disk) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
@@ -213,39 +214,40 @@ public:
         return published_stats_;
     }
 
-    // Slot persistence. execution_mutex_ excludes the worker's decode round; queue_mutex_ settles
-    // whether the lane is serving a request, which is the one state these must refuse — the file
-    // would otherwise capture a sequence mid-round, or overwrite one that is still generating.
-    [[nodiscard]] runtime::SlotTransferResult save_slot(std::uint32_t lane, const std::string& path,
-                                                        std::string_view identity) {
+    // Tiered conversation cache management. execution_mutex_ excludes the worker's decode round
+    // while the catalog is inspected or a resident conversation is dropped.
+    [[nodiscard]] std::vector<ConversationSummary> list_conversations() {
+        if (conversations_ == nullptr || !conversations_->enabled()) { return {}; }
         std::scoped_lock lock(execution_mutex_);
-        require_idle_lane(lane, "save");
-        return instance_.program->save_retained_lane(lane, path, identity);
-    }
-
-    [[nodiscard]] runtime::SlotTransferResult
-    restore_slot(std::uint32_t lane, const std::string& path, std::string_view identity) {
-        std::scoped_lock lock(execution_mutex_);
-        require_idle_lane(lane, "restore");
-        return instance_.program->restore_retained_lane(lane, path, identity);
-    }
-
-    [[nodiscard]] std::uint32_t erase_slot(std::uint32_t lane) {
-        std::scoped_lock lock(execution_mutex_);
-        require_idle_lane(lane, "erase");
-        return instance_.program->erase_retained_lane(lane);
-    }
-
-    [[nodiscard]] std::uint32_t slot_count() const noexcept { return max_concurrency_; }
-
-    // Reports the retained token count per lane for GET /slots.
-    [[nodiscard]] std::vector<std::uint32_t> slot_token_counts() const {
-        std::scoped_lock lock(execution_mutex_);
-        std::vector<std::uint32_t> out(max_concurrency_, 0);
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            out[lane] = instance_.program->retained_token_count_lane(lane);
+        std::vector<ConversationSummary> out;
+        for (const auto& record : conversations_->records()) {
+            ConversationSummary summary;
+            summary.id       = record.id;
+            summary.name     = record.name;
+            summary.tokens   = static_cast<std::uint32_t>(record.ledger.size());
+            summary.frontier = record.checkpoints.empty()
+                                   ? 0U
+                                   : record.checkpoints.back().frontier;
+            out.push_back(std::move(summary));
         }
         return out;
+    }
+
+    [[nodiscard]] bool erase_conversation(ConversationId id) {
+        if (conversations_ == nullptr || !conversations_->enabled()) { return false; }
+        std::scoped_lock lock(execution_mutex_);
+        const ConversationRecord* record = conversations_->find(id);
+        if (record == nullptr) { return false; }
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (lane_conversation_[lane] == id && slots_[lane] == nullptr) {
+                instance_.program->evict_retained_lane(lane);
+                lane_conversation_[lane] = 0;
+                invalidate_lane_plans(lane);
+            }
+        }
+        if (disk_ != nullptr) { disk_->erase(record->name); }
+        conversations_->erase(id);
+        return true;
     }
 
     void reset_memory_peaks() noexcept {
@@ -476,6 +478,17 @@ private:
             conversations_->touch(*record);
             conversations_->prune_redundant_checkpoints(*record);
             conversations_->enforce_ram_budget();
+
+            // Durable tier: hand the writer shared page ownership; the writer serializes
+            // outside the execution lock while admission keeps running.
+            if (disk_ != nullptr) {
+                ConversationSnapshot snapshot;
+                snapshot.ledger         = record->ledger;
+                snapshot.prefix_identity = record->prefix_identity;
+                snapshot.payload        = record->payload;
+                snapshot.checkpoints    = record->checkpoints;
+                disk_->schedule(record->name, std::move(snapshot));
+            }
         } catch (...) {
             // The host copy is best-effort by contract; the resident lane remains valid.
         }
@@ -500,10 +513,10 @@ private:
 
     [[nodiscard]] const ConversationCheckpoint*
     best_cached_checkpoint(const std::shared_ptr<Request>& request, ConversationId& matched_id) {
-        const ConversationCheckpoint* best     = nullptr;
-        const ConversationRecord* best_record  = nullptr;
-        std::size_t best_index                 = 0;
-        std::uint32_t best_frontier            = 0;
+        const ConversationCheckpoint* best    = nullptr;
+        const ConversationRecord* best_record = nullptr;
+        std::size_t best_index                = 0;
+        std::uint32_t best_frontier           = 0;
         for (auto& record : conversations_->records()) {
             if (conversation_resident_elsewhere(record.id, max_concurrency_)) { continue; }
             for (std::size_t i = 0; i < record.checkpoints.size(); ++i) {
@@ -519,9 +532,71 @@ private:
             }
         }
         if (best == nullptr) { return nullptr; }
-        matched_id = best_record->id;
+        matched_id          = best_record->id;
         cached_match_index_ = best_index;
         return best;
+    }
+
+    // Durable tier: loads the best matching disk snapshot into the RAM catalog and returns its
+    // conversation id, or 0 when nothing on disk matches. Loading pays the storage round trip,
+    // so this runs only after the RAM tier offered nothing better.
+    [[nodiscard]] ConversationId promote_disk_conversation(const std::shared_ptr<Request>& request) {
+        const DiskConversationEntry* best_entry = nullptr;
+        std::uint32_t best_frontier             = 0;
+        for (const auto& [name, entry] : disk_->catalog()) {
+            if (entry.checkpoint_frontiers.empty()) { continue; }
+            const std::uint32_t frontier =
+                *std::max_element(entry.checkpoint_frontiers.begin(),
+                                  entry.checkpoint_frontiers.end());
+            if (frontier <= best_frontier) { continue; }
+            best_entry    = &entry;
+            best_frontier = frontier;
+        }
+        if (best_entry == nullptr) { return 0; }
+
+        try {
+            ConversationSnapshot snapshot = disk_->load(best_entry->name);
+            // A previous promotion of the same file may still sit uncatalogued on no lane.
+            std::erase_if(conversations_->records(),
+                          [&](const ConversationRecord& existing) {
+                              return existing.name == best_entry->name &&
+                                     !conversation_resident_elsewhere(existing.id,
+                                                                      max_concurrency_);
+                          });
+            ConversationRecord& record    = conversations_->create(best_entry->name);
+            record.ledger                 = std::move(snapshot.ledger);
+            record.prefix_identity        = std::move(snapshot.prefix_identity);
+            record.payload                = std::move(snapshot.payload);
+            record.parked_text_pages      = record.payload.text_pages.empty()
+                                                ? 0
+                                                : record.payload.text_pages.front().size();
+            record.parked_backend_pages =
+                record.payload.has_backend_kv && !record.payload.backend_pages.empty()
+                    ? record.payload.backend_pages.front().size()
+                    : 0;
+            record.checkpoints = std::move(snapshot.checkpoints);
+
+            std::size_t best_index         = 0;
+            std::uint32_t best_checkpoint  = 0;
+            for (std::size_t i = 0; i < record.checkpoints.size(); ++i) {
+                const auto& checkpoint = record.checkpoints[i];
+                if (checkpoint.frontier <= best_checkpoint) { continue; }
+                if (instance_.program->conversation_checkpoint_matches(
+                        checkpoint, record.ledger, record.prefix_identity, request->prompt)) {
+                    best_index     = i;
+                    best_checkpoint = checkpoint.frontier;
+                }
+            }
+            if (best_checkpoint == 0) {
+                conversations_->erase(record.id);
+                return 0;
+            }
+            conversations_->touch(record);
+            cached_match_index_ = best_index;
+            return record.id;
+        } catch (...) {
+            return 0; // unreadable snapshots are inert until overwritten or evicted.
+        }
     }
 
     // Restores the matched checkpoint into an idle lane. Returns false when the restore or the
@@ -542,7 +617,8 @@ private:
                               return candidate.frontier > frontier;
                           });
             const std::size_t pages = (frontier + kPagedKVPageSize - 1) / kPagedKVPageSize;
-            const auto truncate = [&](std::vector<std::vector<std::vector<std::byte>>>& planes,
+            const auto truncate = [&](std::vector<std::vector<ConversationKvPayload::PageBytes>>&
+                                          planes,
                                       std::size_t& parked) {
                 for (auto& plane : planes) {
                     if (plane.size() > pages) { plane.resize(pages); }
@@ -968,7 +1044,22 @@ private:
         if (conversations_ != nullptr && conversations_->enabled()) {
             ConversationId matched = 0;
             const ConversationCheckpoint* checkpoint = best_cached_checkpoint(request, matched);
-            if (checkpoint != nullptr && checkpoint->frontier > selected_reuse) {
+            std::uint32_t cached_frontier =
+                checkpoint != nullptr ? checkpoint->frontier : 0U;
+
+            // Durable tier: consulted only when RAM offers nothing better, because loading a
+            // snapshot pays the storage round trip.
+            if ((checkpoint == nullptr || cached_frontier <= selected_reuse) && disk_ != nullptr) {
+                const ConversationId disk_match = promote_disk_conversation(request);
+                if (disk_match != 0) {
+                    matched   = disk_match;
+                    checkpoint = &conversations_->find(matched)
+                                      ->checkpoints[cached_match_index_];
+                    cached_frontier = checkpoint->frontier;
+                }
+            }
+
+            if (checkpoint != nullptr && cached_frontier > selected_reuse) {
                 // Prefer a lane whose resident state is worthless; a retained lane is parked
                 // inside the restore path first.
                 std::optional<std::uint32_t> target;
@@ -1453,6 +1544,7 @@ private:
     const std::chrono::milliseconds pending_timeout_;
     const AdmissionResources admission_capacity_;
     ConversationCache* conversations_ = nullptr;
+    ConversationDiskCache* disk_ = nullptr;
     // Which cached conversation each lane's resident state belongs to; 0 = uncatalogued.
     std::array<ConversationId, kMaximumConcurrency> lane_conversation_{};
 

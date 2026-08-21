@@ -176,13 +176,6 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
 
-    // Slot persistence for one retained lane. The caller guarantees the lane is idle.
-    [[nodiscard]] ninfer::runtime::SlotTransferResult
-    save_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
-    [[nodiscard]] ninfer::runtime::SlotTransferResult
-    restore_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
-    [[nodiscard]] std::uint32_t erase_retained_lane(std::uint32_t lane) noexcept;
-    [[nodiscard]] std::uint32_t retained_token_count_lane(std::uint32_t lane) const noexcept;
 
     // Conversation-tiered checkpoint cache. Capture requires an idle retained lane at a
     // retention boundary; restore rebuilds a lane from host bytes and leaves it retained.

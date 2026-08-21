@@ -2252,5 +2252,4 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
 
-#include "targets/qwen3_6/impl/runtime/slot_persist_impl.h"
 #include "targets/qwen3_6/impl/runtime/conversation_persist_impl.h"

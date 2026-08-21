@@ -27,9 +27,6 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
-    // Directory holding persisted KV slots. Empty disables /slots save and restore, matching
-    // llama.cpp, which refuses both unless the server was started with --slot-save-path.
-    std::string slot_save_path;
     // Tiered conversation checkpoint cache. A zero RAM budget (the default) disables automatic
     // multi-conversation caching; the disk tier requires a positive budget and directory.
     std::size_t conversation_cache_ram_mib  = 0;
