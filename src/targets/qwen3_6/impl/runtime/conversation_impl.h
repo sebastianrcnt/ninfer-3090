@@ -420,6 +420,10 @@ void ProgramImplCore::restore_conversation_lane(std::uint32_t lane,
     }
 }
 
+std::uint32_t ProgramImplCore::retained_token_count_lane(std::uint32_t lane) const noexcept {
+    return has_retained_lane(lane) ? static_cast<std::uint32_t>(sequences[lane].ledger.size()) : 0U;
+}
+
 std::optional<std::size_t> ProgramImplCore::select_conversation_checkpoint(
     const PreparedPromptData& prompt, const std::vector<TokenId>& ledger,
     const std::vector<std::byte>& identity_blob,
