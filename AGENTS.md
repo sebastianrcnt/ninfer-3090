@@ -299,7 +299,13 @@ run and why.
 
 ## Local environment
 
-These are conventional project resources, not a checklist of resources every task must use:
+A checkout may sit beside an untracked `AGENTS.LOCAL.md` describing the machine it is on:
+hardware, paths, service topology, and hazards that belong to that host rather than to the
+project. It is deliberately not in the repository, because none of it is true of any other
+machine. Where it and this section disagree about the environment, the local file is the
+one that was written by someone looking at the machine.
+
+The table below is the project's own convention, and a host may depart from all of it:
 
 | Purpose | Path |
 |---|---|
@@ -324,6 +330,12 @@ NINFER_WEIGHTS=out/qwen3_6_27b.ninfer
 ```
 
 ## Commits
+
+## Work tracking
+
+Every task must be identified as `issue/#<number>`, including work that is delivered through a
+pull request. Use that identifier consistently in branch names, commit messages, pull-request
+titles and descriptions, status reports, and other task-facing records.
 
 Create a commit only when the user requests one. Use Conventional Commit-style subjects, for
 example:
