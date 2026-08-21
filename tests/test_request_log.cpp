@@ -275,6 +275,21 @@ int main() {
     failures += check(format_request_done(context, outcome).find("reuse=restore_turn_checkpoint") !=
                           std::string::npos,
                       "human request log omits prefix reuse path");
+    const std::string done_line = format_request_done(context, outcome);
+    failures += check(done_line.find("prompt=401 computed=300 gen=1024") != std::string::npos,
+                      "human done line does not state computed prefill tokens");
+    failures += check(done_line.find("cache=101 (25%)") != std::string::npos,
+                      "human done line omits the cache share percentage");
+    failures += check(done_line.find("queue=0.00s") != std::string::npos,
+                      "human done line omits the ingress queue wait");
+    failures += check(done_line.find("prefill=0.23s (1278.9tok/s)") != std::string::npos,
+                      "human done line pairs the prefill duration with its rate");
+    failures += check(done_line.find("decode=5.35s (191.4tok/s)") != std::string::npos,
+                      "human done line pairs the decode duration with its rate");
+    failures += check(done_line.find("wall=5.70s") != std::string::npos,
+                      "human done line omits the wall duration");
+    failures += check(done_line.find("ttft=") == std::string::npos,
+                      "human done line keeps the ttft field that per-phase durations supersede");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
     failures += check(format_request_start(context).find("cache=") == std::string::npos,

@@ -333,8 +333,8 @@ NINFER_WEIGHTS=out/qwen3_6_27b.ninfer
 
 ## Work tracking
 
-Every task must be identified as `issue/#<number>`, including work that is delivered through a
-pull request. Use that identifier consistently in branch names, commit messages, pull-request
+Every task must be identified as `issue/<number>`, including work that is delivered through a
+pull request (branch names drop the `#`: `issue/15`). Use that identifier consistently in branch names, commit messages, pull-request
 titles and descriptions, status reports, and other task-facing records.
 
 Create a commit only when the user requests one. Use Conventional Commit-style subjects, for
