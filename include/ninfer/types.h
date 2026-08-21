@@ -69,6 +69,26 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+// Tiered conversation checkpoint cache. A lane is a GPU execution resource, not a conversation:
+// these budgets decide how many logical conversations one lane can serve in turn without falling
+// back to a full re-prefill.
+struct ConversationCacheOptions {
+    // Global hot-cache payload budget across every cached conversation. Zero disables automatic
+    // multi-conversation caching, leaving only the lane's own resident prefix.
+    std::uint64_t ram_budget_bytes = 0;
+    // Durable snapshot directory. Empty disables the disk tier; when set, the disk budget must be
+    // positive. Disk is the restart-recovery and overflow tier, not the interactive one.
+    std::filesystem::path disk_dir;
+    std::uint64_t disk_budget_bytes = 0;
+    // Historical checkpoints retained per conversation beyond the newest boundary, and the
+    // minimum token spacing between retained boundaries.
+    std::uint32_t context_checkpoints = 32;
+    std::uint32_t checkpoint_min_step = 8192;
+    // Optional diagnostic sink for catalog-level events, such as refusing a snapshot written by a
+    // different build.
+    std::function<void(const std::string&)> report;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     // Optional second container holding a speculative drafter. DFlash 2 drafters
@@ -87,6 +107,7 @@ struct EngineOptions {
     bool enable_vision  = false;
     bool block_no_hanja = false; // GPU UTF-8 policy matching llama.cpp no-hanja.gbnf.
     bool use_cuda_graph = true;
+    ConversationCacheOptions conversation_cache;
     LoadProgress load_progress;
 };
 
@@ -424,6 +445,8 @@ struct RuntimeStats {
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;
     std::uint32_t waiting_requests      = 0;
+    // Conversations brought back onto a lane from the RAM or disk tier of the conversation cache.
+    std::uint64_t conversation_cache_restores = 0;
 };
 
 struct LoadSummary {

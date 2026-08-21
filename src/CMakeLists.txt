@@ -36,6 +36,18 @@ ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3)
 
+# Target-agnostic host-side conversation checkpoint cache: catalog, byte budgets, LRU policy, the
+# NINFSLOT v4 container, and the asynchronous disk worker. Deliberately free of CUDA and of every
+# target header, so its policy and format behaviour is exercised on the host.
+add_library(ninfer_conversation_cache STATIC
+  runtime/cache/conversation_snapshot.cpp
+  runtime/cache/conversation_file.cpp
+  runtime/cache/conversation_cache.cpp)
+ninfer_internal_includes(ninfer_conversation_cache)
+target_include_directories(ninfer_conversation_cache PUBLIC ${PROJECT_SOURCE_DIR}/include)
+find_package(Threads REQUIRED)
+target_link_libraries(ninfer_conversation_cache PUBLIC Threads::Threads)
+
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
   artifact/reader.cpp
@@ -312,6 +324,7 @@ add_subdirectory(targets/qwen3_6_35b_a3b)
 target_link_libraries(ninfer_engine
   PRIVATE
     ninfer_artifact
+    ninfer_conversation_cache
     ninfer_core
     ninfer_ops
     ninfer_text

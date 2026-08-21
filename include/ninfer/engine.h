@@ -60,11 +60,15 @@ private:
     friend class Engine;
 };
 
-// Byte and token totals for one slot transfer; the HTTP layer renders these as llama.cpp's
-// n_saved/n_written and n_restored/n_read.
-struct SlotTransfer {
-    std::uint32_t tokens = 0;
-    std::uint64_t bytes  = 0;
+// Observable state of the tiered conversation checkpoint cache.
+struct ConversationCacheSummary {
+    std::uint32_t conversations           = 0;
+    std::uint32_t resident_conversations  = 0;
+    std::uint32_t checkpoints             = 0;
+    std::uint64_t resident_bytes          = 0;
+    std::uint64_t disk_bytes              = 0;
+    std::uint32_t pending_writes          = 0;
+    std::uint32_t adopted_at_startup      = 0;
 };
 
 class Engine {
@@ -105,14 +109,12 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const;
     void reset_memory_peaks() noexcept;
 
-    // Persisted KV slots, matching llama.cpp's /slots surface. A slot is one request lane; the
-    // lane must not be serving a request, and restore refuses a file written for another model,
-    // KV format, or speculative backend rather than reinterpreting its bytes.
+    // Execution lanes, reported by llama.cpp's read-only /slots surface. A slot is a lane, never
+    // a conversation: conversation state is owned by the checkpoint cache below and moves between
+    // lanes, RAM, and local disk without a client naming it.
     [[nodiscard]] std::uint32_t slot_count() const;
     [[nodiscard]] std::vector<std::uint32_t> slot_token_counts() const;
-    SlotTransfer save_slot(std::uint32_t slot, const std::string& path);
-    SlotTransfer restore_slot(std::uint32_t slot, const std::string& path);
-    std::uint32_t erase_slot(std::uint32_t slot);
+    [[nodiscard]] ConversationCacheSummary conversation_cache_summary() const;
 
 private:
     class Impl;

@@ -430,6 +430,11 @@ curl http://127.0.0.1:8080/v1/models \
 | `--device N` | CUDA device index | `0` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--conversation-cache-ram-mib N` | global hot conversation-checkpoint budget; `0` disables multi-conversation caching | `0` |
+| `--conversation-cache-dir DIR` | durable conversation snapshots; omitted disables the disk tier | unset |
+| `--conversation-cache-disk-mib N` | global durable-cache budget; required and positive with `--conversation-cache-dir` | unset |
+| `--context-checkpoints N` | historical checkpoints retained per conversation; `0` keeps only the newest boundary | `32` |
+| `--checkpoint-min-step N` | minimum token spacing between retained boundaries; `0` disables the spacing rule | `8192` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|rk8v4` | KV-cache storage; `rk8v4` is experimental and lossy | `bf16` |
@@ -460,6 +465,60 @@ Frequency penalty is `0` for all registered presets. Process flags override regi
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
+
+## Conversation checkpoint cache
+
+A lane is a GPU execution resource, not a conversation. `--max-concurrency` sets how many requests
+execute at once; it does not limit how many conversations the server can resume. The active
+conversation keeps its live state and newest boundary on the GPU, while inactive conversations and
+older boundaries live in a bounded host-RAM cache and, when a directory is configured, a bounded
+local-disk cache.
+
+A cached conversation is identified by its exact token ledger and prepared-prefix identity, media
+included. There is no session id, and neither the OpenAI nor the Anthropic schema is extended: a
+follow-up turn matches because its prepared prefix agrees with a cached one token for token.
+Matching runs in order — the active lane frontier, the lane's turn checkpoint, the RAM catalog,
+the disk catalog — and within a tier takes the greatest valid frontier at or before where the
+prompt diverges. Changing a token still invalidates every later hidden and KV value; the cache
+lowers the replay floor, it does not skip the changed suffix.
+
+Retention keeps the newest completed turn boundary always, adds a historical boundary only when it
+is at least `--checkpoint-min-step` tokens beyond the preceding retained one, and keeps at most
+`--context-checkpoints` historical boundaries per conversation. When a cap or the RAM budget
+binds, redundant and least-recently-used boundaries go first, then the least-recently-used
+inactive conversation; a conversation a lane is currently serving is never evicted.
+
+The two tiers have different jobs, matching their measured bandwidths. Host RAM restores a full
+snapshot in a fraction of a second and is the interactive tier. Local disk is the restart-recovery
+and overflow tier: a durable snapshot is published asynchronously after a completed request,
+through a sibling temporary and an atomic rename, with at most one write in flight and one
+coalesced newest snapshot per conversation. A restart reads only the catalog headers, ledgers, and
+checkpoint records; a payload is read when a prompt actually matches it.
+
+A durable snapshot is a `NINFSLOT` v4 file. Restore validates the artifact build id, KV format and
+capacity, page geometry, speculative backend, section sizes, and the exact end of the file before
+any device memory is touched, and refuses everything else rather than reinterpreting its bytes.
+Files this build cannot use are removed from the cache directory, which the server owns
+exclusively; `--conversation-cache-dir` must not point at a directory holding anything else.
+`--no-prefix-reuse` and a conversation-cache budget contradict each other and are refused at
+startup: the cache exists to extend prefix reuse to conversations that have left the lane.
+
+A configuration for one owner alternating between long conversations on a single GPU:
+
+```bash
+./build/apps/ninfer-serve out/qwen3_8_27b.ninfer \
+  --max-concurrency 1 \
+  --conversation-cache-ram-mib 24576 \
+  --conversation-cache-dir /slots \
+  --conversation-cache-disk-mib 524288 \
+  --context-checkpoints 32 \
+  --checkpoint-min-step 8192
+```
+
+`GET /slots` remains a read-only report of execution lanes. There is no manual save, restore, or
+erase action: conversation state is published by the engine after completed requests rather than
+by a client call, and an artifact without a `build_id` disables the cache entirely rather than
+binding state to an identity that would also accept another model's cache.
 
 ## Structured request log
 

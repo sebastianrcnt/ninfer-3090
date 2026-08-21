@@ -127,9 +127,10 @@ public:
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
 
-    // Page-group payload transfer for slot persistence.  The pool owns the plane layout — page
-    // major keeps a group contiguous, head major interleaves it across heads — so the copy lives
-    // here rather than being re-derived by every caller that wants to serialize a lane.
+    // Page-group payload transfer for conversation checkpoints.  The pool owns the plane layout
+    // — page major keeps a group contiguous, head major interleaves it across heads — so the copy
+    // lives here rather than being re-derived by every caller that wants to move a group to or
+    // from host memory.
     [[nodiscard]] std::size_t page_group_bytes(std::size_t plane_index) const;
     void read_page_group(std::size_t plane_index, std::int32_t page_id, void* host_destination,
                          cudaStream_t stream = nullptr) const;

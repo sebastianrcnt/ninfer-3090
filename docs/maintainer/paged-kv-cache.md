@@ -413,6 +413,15 @@ Plane base 在 Engine lifetime 内保持不变。Consumer 使用 plane base、re
 不得把 block table 展开为 per-layer、per-head 或 per-plane device pointer arrays。Allocator 可以优先返回
 连续 page IDs 改善 locality，但 kernel correctness 和 launch topology 不能依赖这种连续性。
 
+Pool 通过 `read_page_group` / `write_page_group` 以一个 page group 为单位与 host 交换 packed payload，
+plane 布局仍由 pool 拥有。这是 conversation checkpoint cache 的唯一 KV 传输入口：它经一份有界 pinned
+staging buffer 搬运，host 常驻量与 conversation 大小无关。
+
+Page group 内每个 token slot 的 K、V、code 和 scale 相互独立，量化 grouping 沿 head 维度而非 token 维度。
+因此一个 page 内位置 `p` 的内容不受此后写入位置 `q > p` 的影响：一个 host page 副本对任何 frontier
+`f <= q` 的 checkpoint 都逐字节有效。Conversation cache 的 checkpoint 共享与 branch copy-on-write 共享
+正是建立在这条性质上；破坏它的存储布局同时会破坏这两种共享。
+
 ### 5.3 Why K/V and layers remain grouped inside a pool
 
 同一 pool 内的 K、V、code、scale 和 full-attention layers 具有相同 frontier 和 lifetime。将它们分别

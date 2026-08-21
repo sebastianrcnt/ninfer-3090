@@ -701,19 +701,53 @@ Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState o
 - incoming prompt 完整包含 current resume frontier 并有后续 suffix 时，从该 frontier prefill suffix；
 - incoming prompt 匹配已保存 turn checkpoint 并在其后有新 suffix 时，在 atomic admission transaction
   提交后把 growing allocations truncate 到 checkpoint frontier、恢复完整 checkpoint，再 prefill suffix；
-- common prefix 结束在没有 checkpoint 的任意其他位置时视为 cache miss。
+- common prefix 结束在没有 GPU checkpoint 的位置时，转入 §6.5 的 conversation checkpoint cache。
 
 Turn-checkpoint restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
 本身不是 checkpoint；当前架构不支持 arbitrary longest-common-prefix reuse。
 
 一个 retained entry 同时只能被一个 active request 消费。多个 active requests 不共享同一份可写
-sequence state，也不使用 copy-on-write branching。Request-local RNG、sampling、stop、generation
+sequence state。Request-local RNG、sampling、stop、generation
 limit 和 output state 始终由新 request 创建。
 
 Retained state 占用实际 state-pool memory，但不占 active control slot，也不保留 future growth
 reservation。Active admission 优先；cache occupancy 阻塞原本可行的 request 前，先驱逐 free lanes 上的
 retained entries。Planner 不复制或迁移 retained physical state，而是在 free lanes 中选择最大合法 reuse。
 只有在 slot/lane 和完整 entitlement 都已满足后才能 claim cache ownership。
+
+### 6.5 Conversation checkpoint cache
+
+Lane 是 GPU execution resource，不是 conversation。一条 lane 可以先后服务多个 logical conversations，
+因此 conversation state 不由 lane 拥有，也不由 client session id 命名：一个 cached conversation 就是它
+的 exact token ledger 与 prepared-prefix identity（含 media identity）。
+
+Ownership 分界：
+
+- Qwen3.6 family runtime 拥有 checkpoint semantics、capture/restore state transaction、divergence
+  selection、MTP state 与 exact prefix coverage；
+- `src/runtime` 拥有 conversation catalog、global byte budgets、LRU policy、asynchronous disk worker
+  与 public Engine integration。
+
+每条 lane 仍然只有两个 GPU GDN slots：live state 与 newest turn checkpoint。历史 checkpoints 不占
+GPU slot。一个 cached conversation 只存一份 packed KV payload；历史 checkpoints 共享这些 immutable
+host pages，只额外保存自己的 frontier、hidden state、GDN convolution/recurrent state 与 speculative
+state。Branch 与其 parent 之间同样 copy-on-write 共享公共 host pages：page 内的每个 token slot 独立，
+因此低于 divergence 的所有可读位置在共享页里逐字节相同。
+
+Capture 发生在 round boundary：一次完成的 request 之后，以及一个长 turn 内跨越 spacing grid 时。
+Append 只复制新写入的 pages，因此同一 conversation 的稳态续写不产生 prefix 级 host 或 disk transfer。
+Retention 永远保留最新的 completed turn boundary，只有当一个 boundary 比前一个保留 boundary 至少远
+`checkpoint_min_step` tokens 时才追加历史 boundary，每个 conversation 最多保留 `context_checkpoints`
+个历史 boundary。超出 per-conversation cap 或 global RAM budget 时，先移除冗余/相邻的旧 checkpoints，
+再移除 least-recently-used 历史 checkpoints，最后移除 least-recently-used inactive conversation；
+lane 正在服务的 conversation 永不被驱逐。
+
+Matching 顺序为 active GPU frontier、active GPU turn checkpoint、RAM catalog、disk catalog，最后才是
+`FullReset`；同一 tier 内取不超过 divergence 的最大合法 frontier。RAM 是 interactive tier，local disk
+是 restart-recovery 与 overflow tier。Disk snapshot 在 completed request 之后异步发布，每个
+conversation 至多一个 in-flight write 和一个 coalesced newest pending snapshot，经 sibling temporary
+与 atomic rename 落盘，替换完成前保留上一份有效 snapshot。启动时只读取 catalog headers、ledger、
+identity 与 checkpoint records；payload 在 prompt 真正命中时才惰性读取。
 
 Prefix lookup 只改变 uncached prompt work 和 prospective reuse plan，不自行授予 queue priority。它可以保守地
 缩短 §5.5 的 service projection，但仍须通过相同 protected-head qualification；无论是否命中，最终 active

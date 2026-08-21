@@ -186,6 +186,8 @@ still use MTP3 as documented above.
 - `low`, `medium`, and `xhigh` reasoning modes.
 - Qwen3.8 image understanding with ReplaySSM and MTP3.
 - Prefix reuse for faster repeated or shared prompts.
+- A tiered conversation checkpoint cache in host RAM and local disk, so alternating conversations
+  and mid-history edits resume from the longest reusable state instead of a full re-prefill.
 - Qwen3.6-35B image understanding with a guarded 32K profile.
 - Windows one-user and eight-user launchers with safe tested defaults.
 
@@ -262,6 +264,7 @@ The server supports:
 - OpenAI Responses Core with streaming and local continuation state;
 - Anthropic Messages;
 - compatible-prefix reuse;
+- a bounded RAM/disk conversation checkpoint cache with durable restart recovery;
 - prompt-rendered function tools and parsed tool calls;
 - bounded pending-request admission and JSONL request logs.
 
