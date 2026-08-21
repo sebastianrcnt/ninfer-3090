@@ -25,6 +25,9 @@ struct MediaInputCapacity;
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
     double ttft_seconds    = 0.0;
+    // Engine-side ingress wait: the part of TTFT not explained by preparation, vision,
+    // or prefill execution.
+    double queue_seconds   = 0.0;
     double vision_seconds  = 0.0;
     double prefill_seconds = 0.0;
     double decode_seconds  = 0.0;

@@ -324,23 +324,30 @@ std::string format_request_first_token(const RequestLogContext& context, double 
 std::string format_request_done(const RequestLogContext& context,
                                 const GenerationOutcome& outcome) {
     const GenerationMetrics& metrics = outcome.metrics;
-    const double ttft_ms             = metrics.ttft_seconds * 1000.0;
     // Prefill emits the first token; the remaining (gen - 1) come from decode.
     const double decode_tokens =
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
-    const double computed_prefill_tokens = static_cast<double>(
-        std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));
+    const int computed_prefill_tokens =
+        std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens));
+    const double cache_percentage =
+        outcome.prompt_tokens != 0
+            ? 100.0 * static_cast<double>(metrics.prefix_cache_hit_tokens) /
+                  static_cast<double>(outcome.prompt_tokens)
+            : 0.0;
 
     std::ostringstream out;
     out << "[req " << context.id << "] done finish="
         << (outcome.tool_calls.empty() ? finish_reason_name(outcome.finish_reason) : "tool_calls");
     if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
-    out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
-        << " cache=" << metrics.prefix_cache_hit_tokens
-        << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path) << " ttft=" << std::fixed
-        << std::setprecision(0) << ttft_ms << "ms"
-        << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
-        << " decode=" << rate(decode_tokens, metrics.decode_seconds)
+    out << " prompt=" << outcome.prompt_tokens << " computed=" << computed_prefill_tokens
+        << " gen=" << outcome.completion_tokens << " cache=" << metrics.prefix_cache_hit_tokens
+        << std::fixed << std::setprecision(0) << " (" << cache_percentage << "%)"
+        << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path)
+        << " queue=" << std::setprecision(2) << metrics.queue_seconds << 's'
+        << " prefill=" << metrics.prefill_seconds << 's'
+        << " (" << rate(computed_prefill_tokens, metrics.prefill_seconds) << ')'
+        << " decode=" << metrics.decode_seconds << 's'
+        << " (" << rate(decode_tokens, metrics.decode_seconds) << ')'
         << " wall=" << seconds_str(metrics.total_seconds)
         << " speculative=" << speculative_str(metrics);
     return out.str();

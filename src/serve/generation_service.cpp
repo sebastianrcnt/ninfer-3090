@@ -456,6 +456,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.vision_seconds  = result.timings.vision_seconds;
     outcome.metrics.prefill_seconds = result.timings.prefill_seconds;
     outcome.metrics.decode_seconds  = result.timings.decode_seconds;
+    outcome.metrics.queue_seconds   = std::max(
+        0.0, outcome.metrics.ttft_seconds - outcome.metrics.prepare_seconds -
+                 outcome.metrics.vision_seconds - outcome.metrics.prefill_seconds);
     outcome.metrics.total_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
