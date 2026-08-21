@@ -206,6 +206,17 @@ int main() {
                       "resolved preserve-thinking metadata missing");
     failures += check(started.at("request").at("sampling").at("seed") == 7632647173703958409ULL,
                       "resolved seed missing");
+    ninfer::GenerationPlan plan;
+    plan.prompt_tokens        = 401;
+    plan.reused_prompt_tokens = 101;
+    plan.prefix_reuse_path    = ninfer::PrefixReusePath::RestoreTurnCheckpoint;
+    const Json admitted =
+        Json::parse(format_request_admitted_json("serve-test", 2500, context, plan));
+    failures += check(admitted.at("event") == "request_admitted", "admission event missing");
+    failures += check(admitted.at("plan").at("prefix_cache_hit_tokens") == 101,
+                      "admission cache-hit tokens missing");
+    failures += check(admitted.at("plan").at("prefix_reuse_path") == "restore_turn_checkpoint",
+                      "admission prefix reuse path missing");
 
     GenerationOutcome outcome;
     outcome.prompt_tokens                       = 401;
@@ -266,6 +277,13 @@ int main() {
                       "human request log omits prefix reuse path");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
+    failures += check(format_request_start(context).find("cache=") == std::string::npos,
+                      "human request log incorrectly delays submission until admission");
+    failures += check(format_request_admitted(context, plan).find("cache=101/401 (25%)") !=
+                          std::string::npos &&
+                          format_request_admitted(context, plan).find(
+                              "reuse=restore_turn_checkpoint") != std::string::npos,
+                      "human request log omits admission prefix reuse plan");
 
     const std::string first_token = format_request_first_token(context, 21.02);
     failures += check(first_token.find("first token") != std::string::npos,
@@ -320,6 +338,7 @@ int main() {
     {
         JsonlRequestLog writer(log_path.string());
         writer.write_request_start(context);
+        writer.write_request_admitted(context, plan);
     }
     {
         JsonlRequestLog writer(log_path.string());
@@ -329,16 +348,21 @@ int main() {
     std::string first_line;
     std::string second_line;
     std::string extra_line;
+    std::string fourth_line;
     std::getline(input, first_line);
     std::getline(input, second_line);
     std::getline(input, extra_line);
-    failures += check(!first_line.empty() && !second_line.empty() && extra_line.empty(),
+    std::getline(input, fourth_line);
+    failures += check(!first_line.empty() && !second_line.empty() && !extra_line.empty() &&
+                          fourth_line.empty(),
                       "JSONL writer did not append exactly one flushed line per event");
-    if (!first_line.empty() && !second_line.empty()) {
+    if (!first_line.empty() && !second_line.empty() && !extra_line.empty()) {
         failures += check(Json::parse(first_line).at("event") == "request_start",
                           "first appended event mismatch");
-        failures += check(Json::parse(second_line).at("event") == "request_error",
+        failures += check(Json::parse(second_line).at("event") == "request_admitted",
                           "second appended event mismatch");
+        failures += check(Json::parse(extra_line).at("event") == "request_error",
+                          "third appended event mismatch");
     }
     input.close();
     std::filesystem::remove(log_path);

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -99,6 +100,13 @@ public:
             }
             ConcurrentExecutor* owner = std::exchange(owner_, nullptr);
             return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
+        }
+
+        void set_plan_callback(std::function<void(GenerationPlan)> callback) {
+            if (owner_ == nullptr || request_ == nullptr) {
+                throw std::logic_error("concurrent submission is empty");
+            }
+            owner_->set_plan_callback(request_, std::move(callback));
         }
 
     private:
@@ -266,12 +274,29 @@ private:
         for (;;) {
             events.clear();
             bool done = false;
+            std::function<void(GenerationPlan)> plan_callback;
+            std::optional<GenerationPlan> plan;
             {
                 std::unique_lock lock(request->mutex);
                 request->cv.wait_for(lock, std::chrono::milliseconds(10),
                                      [&] { return request->done || !request->events.empty(); });
                 events.swap(request->events);
                 done = request->done;
+                if (request->plan && !request->plan_notified && request->plan_callback) {
+                    plan_callback           = std::move(request->plan_callback);
+                    plan                    = request->plan;
+                    request->plan_notified  = true;
+                }
+            }
+
+            if (plan_callback) {
+                try {
+                    plan_callback(*plan);
+                } catch (...) {
+                    caller_error = std::current_exception();
+                    request->cancelled.store(true, std::memory_order_release);
+                    queue_cv_.notify_one();
+                }
             }
 
             if (caller_error == nullptr && sink != nullptr) {
@@ -305,6 +330,16 @@ private:
         }
     }
 
+    void set_plan_callback(const std::shared_ptr<Request>& request,
+                           std::function<void(GenerationPlan)> callback) {
+        std::lock_guard lock(request->mutex);
+        if (request->plan_notified) {
+            throw std::logic_error("admission plan callback was already consumed");
+        }
+        request->plan_callback = std::move(callback);
+        request->cv.notify_one();
+    }
+
     struct Request {
         Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
                 targets::qwen3_6::OutputSession output_session, PromptSummary summary,
@@ -327,6 +362,9 @@ private:
         std::optional<Clock::time_point> first_token;
         std::optional<GenerationBudget> budget;
         std::optional<BeginSummary> begin;
+        std::optional<GenerationPlan> plan;
+        std::function<void(GenerationPlan)> plan_callback;
+        bool plan_notified = false;
         std::vector<TokenId> generated;
         std::string content;
         std::string reasoning;
@@ -847,6 +885,14 @@ private:
             request->backfill_class         = backfill_class;
             slots_[lane]                    = request;
             invalidate_lane_plans(lane);
+            {
+                std::lock_guard lock(request->mutex);
+                request->plan = GenerationPlan{.prompt_tokens = summary.prompt_tokens,
+                                                .reused_prompt_tokens =
+                                                    summary.reusable_prompt_tokens,
+                                                .prefix_reuse_path = summary.prefix_reuse_path};
+            }
+            request->cv.notify_all();
 
             TransientRegion transient;
             if (needs_prefill) {

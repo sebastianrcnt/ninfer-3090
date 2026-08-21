@@ -473,14 +473,15 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v8 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v9 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
 | Event | Contents |
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
-| `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, and stream/message/tool shape |
+| `request_admitted` | the lane-selected prefix-reuse plan: prompt/cache-hit tokens and reuse path |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
@@ -556,8 +557,11 @@ Compatible resident prefixes are reused for both text and multimodal histories u
 started with `--no-prefix-reuse`. A multimodal hit requires matching token types, three-axis MRoPE
 positions, encoded-media digest, grid, and consumer spans; changing an earlier image or video
 therefore resets the prefix instead of reusing placeholder-token KV. Media wholly inside a matched
-prefix skips Vision execution, while new suffix media is encoded normally. The completion log
-reports the reused token count as `cache=`.
+prefix skips Vision execution, while new suffix media is encoded normally. The submitted line is
+written immediately when the request enters the queue. At admission, before prefill begins, a
+separate `admitted` console line and JSONL `request_admitted` event report the selected
+reused-token count as `cache=` and its prefix-reuse path. The completion log retains those fields
+as the execution observation.
 
 The shared family runtime distinguishes `full_reset`, `append_frontier`, and
 `restore_turn_checkpoint`. A turn checkpoint includes the recurrent and selected

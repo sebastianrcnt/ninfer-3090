@@ -243,6 +243,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
+    plan->summary.prefix_reuse_path      = plan->reuse;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;

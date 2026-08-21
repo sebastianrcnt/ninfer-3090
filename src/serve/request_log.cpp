@@ -297,6 +297,20 @@ std::string format_request_start(const RequestLogContext& context) {
     return out.str();
 }
 
+std::string format_request_admitted(const RequestLogContext& context,
+                                    const ninfer::GenerationPlan& plan) {
+    std::ostringstream out;
+    out << "[req " << context.id << "] admitted cache=" << plan.reused_prompt_tokens << '/'
+        << plan.prompt_tokens;
+    if (plan.prompt_tokens != 0) {
+        const double percentage = 100.0 * static_cast<double>(plan.reused_prompt_tokens) /
+                                  static_cast<double>(plan.prompt_tokens);
+        out << " (" << std::fixed << std::setprecision(0) << percentage << "%)";
+    }
+    out << " reuse=" << prefix_reuse_path_name(plan.prefix_reuse_path);
+    return out.str();
+}
+
 // Wall time from the moment the request was logged as submitted, so it covers queueing as
 // well as prefill. The engine-measured ttft on the done line excludes the queue; the two
 // are named differently because they answer different questions.
@@ -457,6 +471,18 @@ std::string format_request_start_json(const std::string& server_instance_id,
     return record.dump();
 }
 
+std::string format_request_admitted_json(const std::string& server_instance_id,
+                                         std::uint64_t timestamp,
+                                         const RequestLogContext& context,
+                                         const ninfer::GenerationPlan& plan) {
+    Json record       = event_base(server_instance_id, timestamp, "request_admitted");
+    record["request"] = request_json(context);
+    record["plan"] = Json{{"prompt_tokens", plan.prompt_tokens},
+                          {"prefix_cache_hit_tokens", plan.reused_prompt_tokens},
+                          {"prefix_reuse_path", prefix_reuse_path_name(plan.prefix_reuse_path)}};
+    return record.dump();
+}
+
 std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                      const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
@@ -577,6 +603,12 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
     if (!enabled()) { return; }
     append(format_request_start_json(server_instance_id_, unix_time_ms(), context));
+}
+
+void JsonlRequestLog::write_request_admitted(const RequestLogContext& context,
+                                             const ninfer::GenerationPlan& plan) {
+    if (!enabled()) { return; }
+    append(format_request_admitted_json(server_instance_id_, unix_time_ms(), context, plan));
 }
 
 void JsonlRequestLog::write_request_done(const RequestLogContext& context,

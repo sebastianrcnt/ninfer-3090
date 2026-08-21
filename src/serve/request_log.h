@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 8;
+inline constexpr int kRequestLogSchemaVersion        = 9;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -64,6 +64,8 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
 
 // Compact console records retained for operator visibility.
 std::string format_request_start(const RequestLogContext& context);
+std::string format_request_admitted(const RequestLogContext& context,
+                                    const ninfer::GenerationPlan& plan);
 std::string format_request_first_token(const RequestLogContext& context, double elapsed_seconds);
 std::string format_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
 std::string format_request_error(const RequestLogContext& context, const std::string& message);
@@ -82,6 +84,10 @@ std::string format_server_start_json(const std::string& server_instance_id,
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context);
+std::string format_request_admitted_json(const std::string& server_instance_id,
+                                         std::uint64_t timestamp_unix_ms,
+                                         const RequestLogContext& context,
+                                         const ninfer::GenerationPlan& plan);
 std::string format_request_done_json(const std::string& server_instance_id,
                                      std::uint64_t timestamp_unix_ms,
                                      const RequestLogContext& context,
@@ -115,6 +121,8 @@ public:
                             const std::string& public_model_id, const ninfer::LoadSummary& load,
                             const ninfer::MemorySummary& memory);
     void write_request_start(const RequestLogContext& context);
+    void write_request_admitted(const RequestLogContext& context,
+                                const ninfer::GenerationPlan& plan);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void write_request_error(const RequestLogContext& context, const std::string& message);
     void write_throughput(const ThroughputReport& report);

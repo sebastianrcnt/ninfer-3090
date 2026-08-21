@@ -126,6 +126,12 @@ void HttpServer::attach_first_token_log(PreparedRequest& prepared,
     };
 }
 
+void HttpServer::attach_admission_log(PreparedRequest& prepared,
+                                      const RequestLogContext& context) {
+    prepared.generation.set_plan_callback(
+        [this, context](ninfer::GenerationPlan plan) { log_request_admitted(context, plan); });
+}
+
 void HttpServer::log_line(const std::string& line) {
     write_console_log(ConsoleLogLevel::Info, line);
 }
@@ -133,6 +139,12 @@ void HttpServer::log_line(const std::string& line) {
 void HttpServer::log_request_start(const RequestLogContext& context) {
     log_line(format_request_start(context));
     request_jsonl_.write_request_start(context);
+}
+
+void HttpServer::log_request_admitted(const RequestLogContext& context,
+                                      const ninfer::GenerationPlan& plan) {
+    log_line(format_request_admitted(context, plan));
+    request_jsonl_.write_request_admitted(context, plan);
 }
 
 void HttpServer::log_request_first_token(const RequestLogContext& context,
@@ -501,6 +513,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const RequestLogContext log_context =
         make_request_log_context(req_id, "openai_chat_completions", request, prepared);
     log_request_start(log_context);
+    attach_admission_log(prepared, log_context);
     attach_first_token_log(prepared, log_context);
 
     if (!request.stream) {
@@ -698,6 +711,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const RequestLogContext log_context =
         make_request_log_context(req_id, "anthropic_messages", request, prepared);
     log_request_start(log_context);
+    attach_admission_log(prepared, log_context);
     attach_first_token_log(prepared, log_context);
 
     if (!request.stream) {

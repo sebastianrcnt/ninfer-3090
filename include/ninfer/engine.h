@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,6 +45,10 @@ public:
 
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept;
+
+    // Invoked by wait()'s consumer thread after admission selects the request's lane and prefix
+    // reuse path. If admission has already happened, the next wait() iteration invokes it.
+    void set_plan_callback(std::function<void(GenerationPlan)> callback);
 
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 

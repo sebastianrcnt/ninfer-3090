@@ -358,6 +358,14 @@ enum class PrefixReusePath : std::uint8_t {
     RestoreTurnCheckpoint,
 };
 
+// The prefix-reuse decision selected for a request's admitted lane. This is available before
+// prefill starts; the matching fields in GenerationResult remain the execution observation.
+struct GenerationPlan {
+    std::uint32_t prompt_tokens        = 0;
+    std::uint32_t reused_prompt_tokens = 0;
+    PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;

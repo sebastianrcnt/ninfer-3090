@@ -60,6 +60,7 @@ public:
     class Concept {
     public:
         virtual ~Concept() = default;
+        virtual void set_plan_callback(std::function<void(GenerationPlan)> callback) = 0;
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
     };
 
@@ -71,6 +72,10 @@ public:
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
             return submission_.wait(sink, cancellation);
+        }
+
+        void set_plan_callback(std::function<void(GenerationPlan)> callback) override {
+            submission_.set_plan_callback(std::move(callback));
         }
 
     private:
@@ -86,6 +91,10 @@ public:
 
     GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
         return state_->wait(sink, cancellation);
+    }
+
+    void set_plan_callback(std::function<void(GenerationPlan)> callback) {
+        state_->set_plan_callback(std::move(callback));
     }
 
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
@@ -109,6 +118,11 @@ GenerationHandle::operator bool() const noexcept { return impl_ != nullptr; }
 const ResolvedSamplingParameters& GenerationHandle::resolved_sampling() const noexcept {
     static const ResolvedSamplingParameters empty;
     return impl_ != nullptr ? impl_->resolved_sampling() : empty;
+}
+
+void GenerationHandle::set_plan_callback(std::function<void(GenerationPlan)> callback) {
+    if (impl_ == nullptr) { throw std::logic_error("GenerationHandle is empty"); }
+    impl_->set_plan_callback(std::move(callback));
 }
 
 GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView& cancellation) {
@@ -260,6 +274,10 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     if (resolved_options.execution.requested_output_tokens == 0) {
         struct ImmediateSubmission {
             GenerationResult result;
+
+            void set_plan_callback(std::function<void(GenerationPlan)> callback) const {
+                callback(GenerationPlan{.prompt_tokens = result.prompt.prompt_tokens});
+            }
 
             GenerationResult wait(OutputSink*, const CancellationView& cancellation) {
                 if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
