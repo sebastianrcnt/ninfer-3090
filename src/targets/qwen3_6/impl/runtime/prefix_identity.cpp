@@ -179,14 +179,47 @@ void read_vector(std::span<const std::byte>& cursor, std::vector<T>& values) {
 
 } // namespace
 
+// Fixed-layout head of one VisionItem. The two vectors that follow it are length-prefixed like
+// every other section, so a video item with per-frame timestamps round-trips as well as an image.
+struct SerializedVisionItem {
+    std::uint8_t modality;
+    std::uint8_t reserved[7];
+    std::int32_t grid_temporal;
+    std::int32_t grid_height;
+    std::int32_t grid_width;
+    std::int32_t padding;
+    std::uint64_t patch_begin;
+    std::uint64_t patch_count;
+    std::array<std::uint8_t, 32> content_digest;
+};
+
+static_assert(sizeof(SerializedVisionItem) == 72, "vision item head layout is part of the format");
+static_assert(sizeof(TokenSpan) == 16, "token span layout is part of the format");
+
 std::vector<std::byte> ResidentPrefixIdentity::serialize() const {
-    if (carries_vision()) {
-        throw std::invalid_argument("prefix identity carries vision items, which slot "
-                                    "persistence does not describe yet");
-    }
     std::vector<std::byte> out;
     append_vector(out, token_types_);
     for (const std::vector<std::int32_t>& axis : positions_) { append_vector(out, axis); }
+
+    // Vision items participate in matches(), so persisting an identity without them would let a
+    // restored prefix compare equal to a prompt carrying different media.
+    const std::uint64_t item_count = vision_items_.size();
+    const auto* count_bytes        = reinterpret_cast<const std::byte*>(&item_count);
+    out.insert(out.end(), count_bytes, count_bytes + sizeof(item_count));
+    for (const VisionItem& item : vision_items_) {
+        SerializedVisionItem head{};
+        head.modality       = static_cast<std::uint8_t>(item.modality);
+        head.grid_temporal  = item.grid.temporal;
+        head.grid_height    = item.grid.height;
+        head.grid_width     = item.grid.width;
+        head.patch_begin    = item.patch_begin;
+        head.patch_count    = item.patch_count;
+        head.content_digest = item.content_digest;
+        const auto* head_bytes = reinterpret_cast<const std::byte*>(&head);
+        out.insert(out.end(), head_bytes, head_bytes + sizeof(head));
+        append_vector(out, item.timestamps);
+        append_vector(out, item.token_spans);
+    }
     return out;
 }
 
@@ -196,6 +229,38 @@ void ResidentPrefixIdentity::deserialize(std::span<const std::byte> bytes) {
         std::span<const std::byte> cursor = bytes;
         read_vector(cursor, token_types_);
         for (std::vector<std::int32_t>& axis : positions_) { read_vector(cursor, axis); }
+
+        std::uint64_t item_count = 0;
+        if (cursor.size() < sizeof(item_count)) {
+            throw std::invalid_argument("prefix identity payload is truncated");
+        }
+        std::memcpy(&item_count, cursor.data(), sizeof(item_count));
+        cursor = cursor.subspan(sizeof(item_count));
+        if (item_count > cursor.size() / sizeof(SerializedVisionItem)) {
+            throw std::invalid_argument("prefix identity vision item count is implausible");
+        }
+        vision_items_.resize(static_cast<std::size_t>(item_count));
+        for (VisionItem& item : vision_items_) {
+            SerializedVisionItem head{};
+            if (cursor.size() < sizeof(head)) {
+                throw std::invalid_argument("prefix identity payload is truncated");
+            }
+            std::memcpy(&head, cursor.data(), sizeof(head));
+            cursor = cursor.subspan(sizeof(head));
+            if (head.modality != static_cast<std::uint8_t>(PromptModality::Image) &&
+                head.modality != static_cast<std::uint8_t>(PromptModality::Video)) {
+                throw std::invalid_argument("prefix identity vision modality is unknown");
+            }
+            item.modality       = static_cast<PromptModality>(head.modality);
+            item.grid.temporal  = head.grid_temporal;
+            item.grid.height    = head.grid_height;
+            item.grid.width     = head.grid_width;
+            item.patch_begin    = static_cast<std::size_t>(head.patch_begin);
+            item.patch_count    = static_cast<std::size_t>(head.patch_count);
+            item.content_digest = head.content_digest;
+            read_vector(cursor, item.timestamps);
+            read_vector(cursor, item.token_spans);
+        }
         if (!cursor.empty()) {
             throw std::invalid_argument("prefix identity payload has trailing bytes");
         }
