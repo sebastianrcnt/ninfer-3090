@@ -209,22 +209,32 @@ bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
 }
 
 template <>
-ninfer::runtime::SlotTransferResult
-Program<Variant>::save_retained_lane(std::uint32_t lane, const std::string& path,
-                                     std::string_view identity) {
-    return impl_->save_retained_lane(lane, path, identity);
+ninfer::runtime::ConversationGeometry
+Program<Variant>::conversation_geometry(std::string_view identity) const {
+    return impl_->conversation_geometry(identity);
 }
 
 template <>
-ninfer::runtime::SlotTransferResult
-Program<Variant>::restore_retained_lane(std::uint32_t lane, const std::string& path,
-                                        std::string_view identity) {
-    return impl_->restore_retained_lane(lane, path, identity);
+ninfer::runtime::ConversationCapture
+Program<Variant>::capture_conversation_lane(std::uint32_t lane, std::string_view identity,
+                                            std::uint32_t shared_frontier, bool turn_boundary) {
+    return impl_->capture_conversation_lane(lane, identity, shared_frontier, turn_boundary);
 }
 
 template <>
-std::uint32_t Program<Variant>::erase_retained_lane(std::uint32_t lane) noexcept {
-    return impl_->erase_retained_lane(lane);
+void Program<Variant>::restore_conversation_lane(
+    std::uint32_t lane, const ninfer::runtime::ConversationSnapshot& snapshot,
+    std::size_t checkpoint_index, std::string_view identity) {
+    impl_->restore_conversation_lane(lane, snapshot, checkpoint_index, identity);
+}
+
+template <>
+std::optional<std::size_t> Program<Variant>::select_conversation_checkpoint(
+    const PreparedPrompt& prompt, const std::vector<TokenId>& ledger,
+    const std::vector<std::byte>& identity,
+    const std::vector<ninfer::runtime::ConversationCheckpoint>& checkpoints) const {
+    return impl_->select_conversation_checkpoint(PreparedPromptAccess::view(prompt), ledger,
+                                                 identity, checkpoints);
 }
 
 template <>

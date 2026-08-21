@@ -43,6 +43,38 @@ int main() {
                       "default KV capacity does not follow max context");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
+    failures += check(defaults.conversation_cache_ram_bytes == 0 &&
+                          defaults.conversation_cache_dir.empty(),
+                      "the conversation cache is not disabled by default");
+    failures += check(defaults.context_checkpoints == 32 && defaults.checkpoint_min_step == 8192,
+                      "conversation checkpoint retention defaults mismatch");
+
+    const ServeOptions cached = parse({"ninfer-serve", "model.ninfer",
+                                       "--conversation-cache-ram-mib", "24576",
+                                       "--conversation-cache-dir", "/slots",
+                                       "--conversation-cache-disk-mib", "524288",
+                                       "--context-checkpoints", "16",
+                                       "--checkpoint-min-step", "4096"});
+    failures += check(cached.conversation_cache_ram_bytes == (24576ULL << 20) &&
+                          cached.conversation_cache_disk_bytes == (524288ULL << 20) &&
+                          cached.conversation_cache_dir == "/slots" &&
+                          cached.context_checkpoints == 16 && cached.checkpoint_min_step == 4096,
+                      "conversation cache options did not parse");
+
+    // A durable tier without a budget, or without a hot tier to promote into, is a configuration
+    // that cannot be honoured rather than one to silently reinterpret.
+    bool refused = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--conversation-cache-ram-mib", "1024",
+                     "--conversation-cache-dir", "/slots"});
+    } catch (const std::exception&) { refused = true; }
+    failures += check(refused, "a conversation cache directory without a disk budget was accepted");
+    refused = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--conversation-cache-dir", "/slots",
+                     "--conversation-cache-disk-mib", "1024"});
+    } catch (const std::exception&) { refused = true; }
+    failures += check(refused, "a durable conversation tier without a hot budget was accepted");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");

@@ -3,7 +3,7 @@
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
 #include "ninfer/types.h"
-#include "runtime/slot_file.h"
+#include "runtime/cache/conversation_cache.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
@@ -44,12 +44,14 @@ public:
     using Plan     = typename Package::RequestPlan;
     using Clock    = std::chrono::steady_clock;
 
-    ConcurrentExecutor(Instance& instance, const EngineOptions& options)
+    ConcurrentExecutor(Instance& instance, const EngineOptions& options,
+                       std::string model_identity)
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
-          admission_capacity_(instance.program->admission_capacity()) {
+          admission_capacity_(instance.program->admission_capacity()),
+          model_identity_(std::move(model_identity)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
@@ -57,6 +59,20 @@ public:
         if (admission_capacity_.active_lanes != max_concurrency_ ||
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
+        }
+        if (options.conversation_cache.ram_budget_bytes != 0) {
+            ConversationCachePolicy cache{
+                .ram_budget_bytes    = options.conversation_cache.ram_budget_bytes,
+                .disk_dir            = options.conversation_cache.disk_dir,
+                .disk_budget_bytes   = options.conversation_cache.disk_budget_bytes,
+                .context_checkpoints = options.conversation_cache.context_checkpoints,
+                .checkpoint_min_step = options.conversation_cache.checkpoint_min_step,
+            };
+            conversations_ = std::make_unique<ConversationCache>(
+                std::move(cache), instance_.program->conversation_geometry(model_identity_));
+            // Headers only: a restart must not read the payloads of every cached conversation.
+            adopted_conversations_ =
+                conversations_->adopt_disk_catalog(options.conversation_cache.report);
         }
         worker_ = std::thread([this] { worker_loop(); });
     }
@@ -200,30 +216,15 @@ public:
         return published_stats_;
     }
 
-    // Slot persistence. execution_mutex_ excludes the worker's decode round; queue_mutex_ settles
-    // whether the lane is serving a request, which is the one state these must refuse — the file
-    // would otherwise capture a sequence mid-round, or overwrite one that is still generating.
-    [[nodiscard]] runtime::SlotTransferResult save_slot(std::uint32_t lane, const std::string& path,
-                                                        std::string_view identity) {
-        std::scoped_lock lock(execution_mutex_);
-        require_idle_lane(lane, "save");
-        return instance_.program->save_retained_lane(lane, path, identity);
-    }
-
-    [[nodiscard]] runtime::SlotTransferResult
-    restore_slot(std::uint32_t lane, const std::string& path, std::string_view identity) {
-        std::scoped_lock lock(execution_mutex_);
-        require_idle_lane(lane, "restore");
-        return instance_.program->restore_retained_lane(lane, path, identity);
-    }
-
-    [[nodiscard]] std::uint32_t erase_slot(std::uint32_t lane) {
-        std::scoped_lock lock(execution_mutex_);
-        require_idle_lane(lane, "erase");
-        return instance_.program->erase_retained_lane(lane);
-    }
-
     [[nodiscard]] std::uint32_t slot_count() const noexcept { return max_concurrency_; }
+
+    [[nodiscard]] ConversationCacheStats conversation_cache_stats() const {
+        return conversations_ != nullptr ? conversations_->stats() : ConversationCacheStats{};
+    }
+
+    [[nodiscard]] std::uint32_t adopted_conversations() const noexcept {
+        return adopted_conversations_;
+    }
 
     // Reports the retained token count per lane for GET /slots.
     [[nodiscard]] std::vector<std::uint32_t> slot_token_counts() const {
@@ -376,6 +377,7 @@ private:
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
         std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions{};
         AdmissionResources admission_resources;
+        std::uint32_t admitted_prompt_tokens = 0;
         std::uint64_t remaining_service_work = 0;
         std::uint64_t backfill_epoch         = 0;
         BackfillClass backfill_class         = BackfillClass::None;
@@ -546,7 +548,7 @@ private:
         const std::uint32_t lane = *request->lane;
         if (cancel_at_boundary) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            instance_.program->abort_lane(lane);
+            abort_lane_state(lane);
             append_output(request, request->output.commit_preview());
             complete_success(request, FinishReason::Cancelled);
             return true;
@@ -566,12 +568,191 @@ private:
         append_output(request, std::move(published));
         if (decision.finished()) {
             complete_success(request, decision.finish_reason);
+            park_completed_lane(lane, request);
             return true;
         }
         return false;
     }
 
     void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
+
+    // --- Conversation cache -------------------------------------------------------------------
+    //
+    // Everything below runs on the worker thread under execution_mutex_, at a round boundary where
+    // the lane state is exactly what a checkpoint describes. Caching is an optimization: a failure
+    // anywhere here drops the lane's cache association and lets the request proceed cold rather
+    // than failing it.
+
+    void release_lane_entry(std::uint32_t lane) {
+        if (conversations_ != nullptr && lane_entry_[lane] != 0) {
+            conversations_->unpin(lane_entry_[lane]);
+        }
+        lane_entry_[lane]             = 0;
+        lane_shared_frontier_[lane]   = 0;
+        lane_captured_frontier_[lane] = 0;
+        lane_periodic_frontier_[lane] = 0;
+    }
+
+    // A request that reuses less of the lane than the lane already shares with its cached
+    // conversation moves the sharing boundary down: the host pages above the new base are about to
+    // be overwritten by a different continuation.
+    void note_lane_reuse(std::uint32_t lane, std::uint32_t reuse_base) {
+        if (conversations_ == nullptr) { return; }
+        if (reuse_base == 0) {
+            release_lane_entry(lane);
+            return;
+        }
+        lane_shared_frontier_[lane] = std::min(lane_shared_frontier_[lane], reuse_base);
+        lane_captured_frontier_[lane] =
+            std::min(lane_captured_frontier_[lane], lane_shared_frontier_[lane]);
+        lane_periodic_frontier_[lane] =
+            std::min(lane_periodic_frontier_[lane], lane_shared_frontier_[lane]);
+    }
+
+    // `known_frontier` lets a caller that already knows the lane's boundary skip a capture that
+    // would add nothing; nullopt means "capture whatever is there".
+    void capture_lane_into_cache(std::uint32_t lane, std::optional<std::uint32_t> known_frontier,
+                                 bool turn_boundary) {
+        if (conversations_ == nullptr) { return; }
+        if (known_frontier &&
+            (*known_frontier == 0 || *known_frontier <= lane_captured_frontier_[lane])) {
+            return;
+        }
+        try {
+            ConversationCapture capture = instance_.program->capture_conversation_lane(
+                lane, model_identity_, lane_shared_frontier_[lane], turn_boundary);
+            const std::uint32_t captured = capture.checkpoint.frontier;
+            const ConversationCache::EntryId entry =
+                conversations_->park(lane_entry_[lane], std::move(capture));
+            if (entry != lane_entry_[lane]) {
+                if (lane_entry_[lane] != 0) { conversations_->unpin(lane_entry_[lane]); }
+                conversations_->pin(entry);
+                lane_entry_[lane] = entry;
+            } else {
+                conversations_->touch(entry);
+            }
+            if (entry == 0) {
+                release_lane_entry(lane);
+                return;
+            }
+            lane_shared_frontier_[lane]   = captured;
+            lane_captured_frontier_[lane] = captured;
+            lane_periodic_frontier_[lane] = std::max(lane_periodic_frontier_[lane], captured);
+        } catch (...) {
+            // Never fail a served request because its state could not be cached.
+            release_lane_entry(lane);
+        }
+    }
+
+    // A completed request leaves a retained continuation on its lane. Publishing it now is what
+    // makes restart recovery come from a finished request rather than from a save raced against a
+    // still-generating one, and it is what lets another conversation take the lane later without
+    // destroying this one.
+    void park_completed_lane(std::uint32_t lane, const std::shared_ptr<Request>& request) noexcept {
+        try {
+            if (conversations_ == nullptr || !instance_.program->has_retained_lane(lane)) {
+                return;
+            }
+            const std::size_t tokens = static_cast<std::size_t>(request->admitted_prompt_tokens) +
+                                       request->generated.size();
+            if (tokens == 0) { return; }
+            capture_lane_into_cache(lane, static_cast<std::uint32_t>(tokens - 1), true);
+        } catch (...) {}
+    }
+
+    // Discarding a lane's model state also discards its claim on the cached conversation: the
+    // pages above the shared frontier are gone, and the pin must not outlive them.
+    void abort_lane_state(std::uint32_t lane) noexcept {
+        instance_.program->abort_lane(lane);
+        try {
+            release_lane_entry(lane);
+        } catch (...) {}
+    }
+
+    // Periodic boundaries inside one long turn, on the same spacing grid the retention policy
+    // uses. Without them a single very long generation would leave nothing between its start and
+    // its end for a later edit to land on.
+    void capture_periodic_boundary(std::uint32_t lane, const std::shared_ptr<Request>& request) {
+        if (conversations_ == nullptr) { return; }
+        const std::uint32_t step = conversations_->options().checkpoint_min_step;
+        // With no spacing grid, or no room for a historical boundary, a periodic capture would be
+        // trimmed away the moment it was parked.
+        if (step == 0 || conversations_->options().context_checkpoints == 0) { return; }
+        const std::size_t tokens =
+            static_cast<std::size_t>(request->admitted_prompt_tokens) + request->generated.size();
+        if (tokens == 0) { return; }
+        const auto frontier = static_cast<std::uint32_t>(tokens - 1);
+        if (static_cast<std::uint64_t>(frontier) <
+            static_cast<std::uint64_t>(lane_periodic_frontier_[lane]) + step) {
+            return;
+        }
+        capture_lane_into_cache(lane, frontier, false);
+    }
+
+    // Brings the best cached continuation for the head request onto a free lane when it beats
+    // everything already resident on the GPU. Returns true when a lane changed, so the caller
+    // re-plans against it.
+    bool hydrate_head_conversation(const std::shared_ptr<Request>& request) {
+        if (conversations_ == nullptr) { return false; }
+        std::uint32_t best_resident = 0;
+        bool have_free              = false;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) { continue; }
+            have_free = true;
+            ensure_lane_plan(request, lane);
+            best_resident = std::max(best_resident,
+                                     request->lane_plans[lane]->summary().reusable_prompt_tokens);
+        }
+        if (!have_free) { return false; }
+
+        const std::optional<ConversationCache::Match> match = conversations_->select(
+            [&](const std::vector<TokenId>& ledger, const std::vector<std::byte>& identity,
+                const std::vector<ConversationCheckpoint>& checkpoints) {
+                return instance_.program->select_conversation_checkpoint(request->prompt, ledger,
+                                                                         identity, checkpoints);
+            });
+        if (!match || match->frontier <= best_resident) { return false; }
+
+        // Prefer the free lane whose own resident prefix is worth least to this request.
+        std::optional<std::uint32_t> target;
+        std::uint32_t target_reuse = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) { continue; }
+            const std::uint32_t reuse =
+                request->lane_plans[lane]->summary().reusable_prompt_tokens;
+            if (!target || reuse < target_reuse) {
+                target       = lane;
+                target_reuse = reuse;
+            }
+        }
+        if (!target || lane_entry_[*target] == match->entry) { return false; }
+
+        const std::shared_ptr<const ConversationSnapshot> snapshot = conversations_->acquire(*match);
+        if (snapshot == nullptr) { return false; }
+
+        const std::uint32_t lane = *target;
+        // Whatever the lane still holds is published first, so displacing a conversation never
+        // destroys it.
+        if (instance_.program->has_retained_lane(lane)) {
+            capture_lane_into_cache(lane, std::nullopt, true);
+        }
+        release_lane_entry(lane);
+        try {
+            instance_.program->restore_conversation_lane(lane, *snapshot, match->checkpoint,
+                                                          model_identity_);
+        } catch (...) {
+            invalidate_lane_plans(lane);
+            return true;
+        }
+        conversations_->pin(match->entry);
+        lane_entry_[lane]             = match->entry;
+        lane_shared_frontier_[lane]   = match->frontier;
+        lane_captured_frontier_[lane] = match->frontier;
+        lane_periodic_frontier_[lane] = match->frontier;
+        ++cumulative_stats_.conversation_cache_restores;
+        invalidate_lane_plans(lane);
+        return true;
+    }
 
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
@@ -603,7 +784,7 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
-            instance_.program->abort_lane(lane);
+            abort_lane_state(lane);
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
                 prefill_lane_.reset();
@@ -701,7 +882,7 @@ private:
                 instance_.request_memory.deactivate();
                 prefill_lane_.reset();
             }
-            instance_.program->abort_lane(lane);
+            abort_lane_state(lane);
             complete_cancelled(request);
             remove_completed_slot(lane);
             return;
@@ -849,6 +1030,7 @@ private:
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
                     instance_.program->evict_retained_lane(retained_lane);
+                    release_lane_entry(retained_lane);
                     invalidate_lane_plans(retained_lane);
                 }
             }
@@ -880,6 +1062,8 @@ private:
             request->generated.reserve(summary.effective_output_tokens);
             request->lane                   = lane;
             request->admission_resources    = summary.admission;
+            request->admitted_prompt_tokens = summary.prompt_tokens;
+            note_lane_reuse(lane, summary.reusable_prompt_tokens);
             request->remaining_service_work = summary.service_work_quanta;
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
@@ -913,7 +1097,7 @@ private:
             publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
-            if (target_started) { instance_.program->abort_lane(lane); }
+            if (target_started) { abort_lane_state(lane); }
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
                 prefill_lane_.reset();
@@ -974,6 +1158,7 @@ private:
 
             std::optional<LaneChoice> head_lane;
             try {
+                (void)hydrate_head_conversation(head);
                 head_lane = find_admission_lane(head);
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
@@ -1140,7 +1325,10 @@ private:
             append_output(request, std::move(published));
             if (terminal[row]) {
                 complete_success(request, finish_reasons[row]);
+                park_completed_lane(lane, request);
                 remove_completed_slot(lane);
+            } else if (!cancelled[row]) {
+                capture_periodic_boundary(lane, request);
             }
         }
         ++cumulative_stats_.decode_rounds;
@@ -1166,7 +1354,7 @@ private:
         protection_.reset();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
-                instance_.program->abort_lane(lane);
+                abort_lane_state(lane);
                 complete_error(slots_[lane], error);
                 slots_[lane].reset();
             }
@@ -1238,17 +1426,6 @@ private:
         }
     }
 
-    void require_idle_lane(std::uint32_t lane, const char* action) const {
-        if (lane >= max_concurrency_) {
-            throw std::out_of_range(std::string("slot ") + action + ": lane is out of range");
-        }
-        std::lock_guard queue_lock(queue_mutex_);
-        if (slots_[lane] != nullptr) {
-            throw std::invalid_argument(std::string("slot ") + action +
-                                        ": lane is serving a request");
-        }
-    }
-
     Instance& instance_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
@@ -1265,12 +1442,22 @@ private:
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
+    // Conversation-cache provenance per lane: which cached conversation the lane is continuing,
+    // how much of its host payload the lane is still known to share, and the frontier already
+    // captured, so a steady append neither recopies its prefix nor re-parks an unchanged boundary.
+    std::array<ConversationCache::EntryId, kMaximumConcurrency> lane_entry_{};
+    std::array<std::uint32_t, kMaximumConcurrency> lane_shared_frontier_{};
+    std::array<std::uint32_t, kMaximumConcurrency> lane_captured_frontier_{};
+    std::array<std::uint32_t, kMaximumConcurrency> lane_periodic_frontier_{};
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
     bool stopping_ = false;
     bool failed_   = false;
+    const std::string model_identity_;
+    std::unique_ptr<ConversationCache> conversations_;
+    std::uint32_t adopted_conversations_ = 0;
     std::thread worker_;
 };
 

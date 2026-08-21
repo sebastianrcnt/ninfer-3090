@@ -87,6 +87,24 @@ int main(int argc, char** argv) {
                  << format_bytes(memory.cuda_graph_allowance_bytes);
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());
 
+        if (options.conversation_cache_ram_bytes != 0) {
+            const ninfer::ConversationCacheSummary cache = service.conversation_cache_summary();
+            std::ostringstream conversations;
+            conversations << "conversation cache ram="
+                          << format_bytes(static_cast<std::size_t>(options.conversation_cache_ram_bytes))
+                          << " checkpoints/conversation=" << options.context_checkpoints
+                          << " min-step=" << options.checkpoint_min_step << " tokens";
+            if (options.conversation_cache_dir.empty()) {
+                conversations << " disk=disabled";
+            } else {
+                conversations << " disk=" << options.conversation_cache_dir << '@'
+                              << format_bytes(static_cast<std::size_t>(options.conversation_cache_disk_bytes))
+                              << " restored=" << cache.adopted_at_startup << " conversation(s)";
+            }
+            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info,
+                                             conversations.str());
+        }
+
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");
         service.warmup();
 

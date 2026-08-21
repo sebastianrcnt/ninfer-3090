@@ -10,7 +10,7 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
-#include "runtime/slot_file.h"
+#include "runtime/cache/conversation_snapshot.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
@@ -229,14 +229,22 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
 
-    // Slot persistence. The caller guarantees the lane is not executing; these synchronize the
-    // device stream themselves. save throws when the lane holds nothing retained, restore throws
-    // when the file describes a different model or KV format and leaves the lane cleared.
-    [[nodiscard]] runtime::SlotTransferResult
-    save_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
-    [[nodiscard]] runtime::SlotTransferResult
-    restore_retained_lane(std::uint32_t lane, const std::string& path, std::string_view identity);
-    [[nodiscard]] std::uint32_t erase_retained_lane(std::uint32_t lane) noexcept;
+    // Conversation checkpoints. The caller guarantees the lane is not executing; these
+    // synchronize the device stream themselves. Capture reads a lane sitting at a round boundary;
+    // restore installs a cached boundary onto a free lane and leaves it cleared on any failure.
+    [[nodiscard]] runtime::ConversationGeometry
+    conversation_geometry(std::string_view identity) const;
+    [[nodiscard]] std::uint32_t conversation_checkpoint_state_bytes() const;
+    [[nodiscard]] runtime::ConversationCapture
+    capture_conversation_lane(std::uint32_t lane, std::string_view identity,
+                              std::uint32_t shared_frontier, bool turn_boundary);
+    void restore_conversation_lane(std::uint32_t lane,
+                                   const runtime::ConversationSnapshot& snapshot,
+                                   std::size_t checkpoint_index, std::string_view identity);
+    [[nodiscard]] std::optional<std::size_t> select_conversation_checkpoint(
+        const PreparedPromptData& prompt, const std::vector<TokenId>& ledger,
+        const std::vector<std::byte>& identity,
+        const std::vector<runtime::ConversationCheckpoint>& checkpoints) const;
     [[nodiscard]] std::uint32_t retained_token_count_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
@@ -292,6 +300,10 @@ public:
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
 
+    // Bounded pinned staging for conversation capture/restore. One page group at a time keeps
+    // host residency independent of how large the cached conversation is.
+    std::optional<PinnedHostBuffer> conversation_staging_;
+
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
@@ -307,6 +319,7 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
 
 private:
+    [[nodiscard]] std::byte* conversation_staging(std::size_t bytes);
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();

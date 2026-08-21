@@ -273,6 +273,15 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.block_no_hanja       = options_.block_no_hanja;
     engine_options.use_cuda_graph       = options_.use_cuda_graph;
     engine_options.speculative          = options_.speculative;
+    engine_options.conversation_cache.ram_budget_bytes = options_.conversation_cache_ram_bytes;
+    engine_options.conversation_cache.disk_dir  = options_.conversation_cache_dir;
+    engine_options.conversation_cache.disk_budget_bytes =
+        options_.conversation_cache_disk_bytes;
+    engine_options.conversation_cache.context_checkpoints = options_.context_checkpoints;
+    engine_options.conversation_cache.checkpoint_min_step = options_.checkpoint_min_step;
+    engine_options.conversation_cache.report              = [](const std::string& message) {
+        write_console_log(ConsoleLogLevel::Warning, "conversation cache: " + message);
+    };
     engine_options.load_progress        = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();

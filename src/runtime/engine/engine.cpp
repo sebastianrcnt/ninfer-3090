@@ -131,6 +131,21 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     return impl->wait(sink, cancellation);
 }
 
+namespace {
+
+// The identity a cached conversation is validated against. model_id and weights_id name the
+// target -- the architecture and the quantization recipe -- and are compile-time constants of the
+// converter, so two artifacts built from different checkpoints carry the same pair. build_id
+// digests the payload and is the only component that separates them. An artifact without one
+// cannot be attributed to the weights that produced it, so its state is never cached rather than
+// bound to an identity that would also accept a different model's cache.
+std::string conversation_identity(const LoadSummary& load) {
+    if (load.build_id.empty()) { return {}; }
+    return load.model_id + '/' + load.weights_id + '/' + load.build_id;
+}
+
+} // namespace
+
 class Engine::Impl {
 public:
     using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
@@ -144,14 +159,23 @@ public:
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
-        executor          = std::visit(
+        std::string identity = conversation_identity(load);
+        if (identity.empty() && options.conversation_cache.ram_budget_bytes != 0) {
+            if (options.conversation_cache.report) {
+                options.conversation_cache.report(
+                    "artifact carries no build_id, so cached conversation state cannot be bound "
+                    "to its weights; the conversation cache is disabled");
+            }
+            options.conversation_cache = ConversationCacheOptions{};
+        }
+        executor = std::visit(
             [&](auto& target_ptr) -> Executor {
                 using Instance =
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                    return std::make_unique<Executor27>(*target_ptr, options);
+                    return std::make_unique<Executor27>(*target_ptr, options, identity);
                 } else {
-                    return std::make_unique<Executor35>(*target_ptr, options);
+                    return std::make_unique<Executor35>(*target_ptr, options, identity);
                 }
             },
             active);
@@ -354,25 +378,6 @@ RuntimeStats Engine::runtime_stats() const {
         impl_->executor);
 }
 
-namespace {
-
-// The identity a slot file is validated against. model_id and weights_id name the target -- the
-// architecture and the quantization recipe -- and are compile-time constants of the converter, so
-// two artifacts built from different checkpoints carry the same pair. build_id digests the payload
-// and is the only component that separates them. An artifact without one cannot be attributed to
-// the weights that produced it, so slot transfer is refused rather than performed against an
-// identity that would also accept a different model's cache.
-std::string slot_identity(const LoadSummary& load) {
-    if (load.build_id.empty()) {
-        throw std::runtime_error(
-            "artifact carries no build_id, so a slot file cannot be bound to its weights; "
-            "stamp the artifact with tools/artifact/build_id.py and reload");
-    }
-    return load.model_id + '/' + load.weights_id + '/' + load.build_id;
-}
-
-} // namespace
-
 std::uint32_t Engine::slot_count() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
@@ -399,46 +404,23 @@ std::vector<std::uint32_t> Engine::slot_token_counts() const {
         impl_->executor);
 }
 
-SlotTransfer Engine::save_slot(std::uint32_t slot, const std::string& path) {
+ConversationCacheSummary Engine::conversation_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const std::string identity = slot_identity(impl_->load);
     return std::visit(
-        [&](auto& executor) -> SlotTransfer {
+        [](const auto& executor) -> ConversationCacheSummary {
             if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
                 throw std::logic_error("Engine executor is not active");
             } else {
-                const runtime::SlotTransferResult result =
-                    executor->save_slot(slot, path, identity);
-                return SlotTransfer{result.tokens, result.bytes};
-            }
-        },
-        impl_->executor);
-}
-
-SlotTransfer Engine::restore_slot(std::uint32_t slot, const std::string& path) {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    const std::string identity = slot_identity(impl_->load);
-    return std::visit(
-        [&](auto& executor) -> SlotTransfer {
-            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
-                throw std::logic_error("Engine executor is not active");
-            } else {
-                const runtime::SlotTransferResult result =
-                    executor->restore_slot(slot, path, identity);
-                return SlotTransfer{result.tokens, result.bytes};
-            }
-        },
-        impl_->executor);
-}
-
-std::uint32_t Engine::erase_slot(std::uint32_t slot) {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](auto& executor) -> std::uint32_t {
-            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>, std::monostate>) {
-                throw std::logic_error("Engine executor is not active");
-            } else {
-                return executor->erase_slot(slot);
+                const runtime::ConversationCacheStats stats = executor->conversation_cache_stats();
+                return ConversationCacheSummary{
+                    .conversations          = stats.conversations,
+                    .resident_conversations = stats.resident_conversations,
+                    .checkpoints            = stats.checkpoints,
+                    .resident_bytes         = stats.resident_bytes,
+                    .disk_bytes             = stats.disk_bytes,
+                    .pending_writes         = stats.pending_writes,
+                    .adopted_at_startup     = executor->adopted_conversations(),
+                };
             }
         },
         impl_->executor);
