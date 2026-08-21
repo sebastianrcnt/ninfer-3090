@@ -176,6 +176,66 @@ int test_preserve_thinking_options() {
     return failures;
 }
 
+int test_enable_thinking_kwargs() {
+    const Json base = {
+        {"model", "m"},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+    };
+    int failures = 0;
+
+    Json kwargs                    = base;
+    kwargs["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    const GenerationRequest kwargs_request =
+        parse_chat_completion_request(kwargs, default_limits());
+    failures += check(kwargs_request.enable_thinking.has_value() && !*kwargs_request.enable_thinking,
+                      "chat_template_kwargs enable_thinking parsed");
+    const ninfer::PromptInput kwargs_prompt = translate(kwargs_request);
+    failures += check(!kwargs_prompt.options.enable_thinking,
+                      "kwargs enable_thinking did not reach PromptInput");
+
+    Json alias                 = base;
+    alias["enable_thinking"]   = false;
+    const GenerationRequest alias_request =
+        parse_chat_completion_request(alias, default_limits());
+    failures += check(alias_request.enable_thinking.has_value() && !*alias_request.enable_thinking,
+                      "top-level enable_thinking alias parsed");
+
+    Json same                 = kwargs;
+    same["enable_thinking"]   = false;
+    const GenerationRequest same_request = parse_chat_completion_request(same, default_limits());
+    failures += check(same_request.enable_thinking.has_value() && !*same_request.enable_thinking,
+                      "matching enable_thinking values rejected");
+
+    Json conflict                 = kwargs;
+    conflict["enable_thinking"]   = true;
+    failures += check(api_code([&] { (void)parse_chat_completion_request(conflict, default_limits()); }) ==
+                          "conflicting_template_option",
+                      "conflicting enable_thinking values accepted");
+
+    Json nulls                  = base;
+    nulls["enable_thinking"]    = nullptr;
+    nulls["chat_template_kwargs"] = Json{{"enable_thinking", nullptr}, {"future", nullptr}};
+    failures +=
+        check(!parse_chat_completion_request(nulls, default_limits()).enable_thinking.has_value(),
+              "null enable_thinking did not remain omitted");
+
+    Json bad_value                    = base;
+    bad_value["chat_template_kwargs"] = Json{{"enable_thinking", "off"}};
+    failures +=
+        check(throws_api([&] { (void)parse_chat_completion_request(bad_value, default_limits()); }),
+              "non-boolean chat_template_kwargs enable_thinking accepted");
+
+    Json effort_none                = base;
+    effort_none["reasoning_effort"] = "none";
+    effort_none["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    const ninfer::PromptInput effort_prompt =
+        translate(parse_chat_completion_request(effort_none, default_limits()));
+    failures += check(!effort_prompt.options.enable_thinking &&
+                          !effort_prompt.options.reasoning_effort,
+                      "kwargs enable_thinking conflicted with matching reasoning_effort");
+    return failures;
+}
+
 int test_reasoning_effort() {
     const Json base = {
         {"model", "m"},
@@ -701,6 +761,7 @@ int main() {
     int failures = 0;
     failures += test_parse_string_content();
     failures += test_preserve_thinking_options();
+    failures += test_enable_thinking_kwargs();
     failures += test_reasoning_effort();
     failures += test_parse_parts_and_flatten();
     failures += test_developer_role_mapped();

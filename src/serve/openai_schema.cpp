@@ -473,41 +473,66 @@ std::string sse_event(const Json& payload) { return "data: " + payload.dump() + 
 
 } // namespace
 
-std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
-    std::optional<bool> top_level;
-    if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
-        if (!body.at("preserve_thinking").is_boolean()) {
-            bad_request("preserve_thinking must be a boolean or null", "preserve_thinking");
-        }
-        top_level = body.at("preserve_thinking").get<bool>();
-    }
+namespace {
 
-    std::optional<bool> template_value;
+std::optional<bool> top_level_thinking_flag(const Json& body, const char* key) {
+    if (!body.contains(key) || body.at(key).is_null()) { return std::nullopt; }
+    if (!body.at(key).is_boolean()) {
+        bad_request(std::string(key) + " must be a boolean or null", key);
+    }
+    return body.at(key).get<bool>();
+}
+
+std::optional<bool> template_thinking_flag(const Json& kwargs, const char* key) {
+    if (!kwargs.contains(key) || kwargs.at(key).is_null()) { return std::nullopt; }
+    if (!kwargs.at(key).is_boolean()) {
+        bad_request(std::string("chat_template_kwargs.") + key + " must be a boolean or null",
+                    "chat_template_kwargs");
+    }
+    return kwargs.at(key).get<bool>();
+}
+
+} // namespace
+
+OpenAIThinkingFlags parse_openai_thinking_flags(const Json& body, bool accept_enable_thinking) {
+    std::optional<bool> top_level_enable;
+    std::optional<bool> top_level_preserve;
+    if (accept_enable_thinking) {
+        top_level_enable = top_level_thinking_flag(body, "enable_thinking");
+    }
+    top_level_preserve = top_level_thinking_flag(body, "preserve_thinking");
+
+    std::optional<bool> template_enable;
+    std::optional<bool> template_preserve;
     if (body.contains("chat_template_kwargs")) {
         const Json& kwargs = body.at("chat_template_kwargs");
         if (!kwargs.is_object()) {
             bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
         }
         for (auto it = kwargs.begin(); it != kwargs.end(); ++it) {
-            if (it.key() != "preserve_thinking" && !it.value().is_null()) {
+            const bool known = it.key() == "preserve_thinking" ||
+                               (accept_enable_thinking && it.key() == "enable_thinking");
+            if (!known && !it.value().is_null()) {
                 bad_request("chat_template_kwargs." + it.key() + " is not supported",
                             "chat_template_kwargs", "chat_template_option_not_supported");
             }
         }
-        if (kwargs.contains("preserve_thinking") && !kwargs.at("preserve_thinking").is_null()) {
-            if (!kwargs.at("preserve_thinking").is_boolean()) {
-                bad_request("chat_template_kwargs.preserve_thinking must be a boolean or null",
-                            "chat_template_kwargs");
-            }
-            template_value = kwargs.at("preserve_thinking").get<bool>();
+        if (accept_enable_thinking) {
+            template_enable = template_thinking_flag(kwargs, "enable_thinking");
         }
+        template_preserve = template_thinking_flag(kwargs, "preserve_thinking");
     }
 
-    if (top_level && template_value && *top_level != *template_value) {
+    if (top_level_enable && template_enable && *top_level_enable != *template_enable) {
+        bad_request("conflicting enable_thinking values", "enable_thinking",
+                    "conflicting_template_option");
+    }
+    if (top_level_preserve && template_preserve && *top_level_preserve != *template_preserve) {
         bad_request("conflicting preserve_thinking values", "preserve_thinking",
                     "conflicting_template_option");
     }
-    return template_value ? template_value : top_level;
+    return {template_enable ? template_enable : top_level_enable,
+            template_preserve ? template_preserve : top_level_preserve};
 }
 
 void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
@@ -547,11 +572,10 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
-    if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
-        out.enable_thinking = get_bool(body, "enable_thinking", false);
-    }
     parse_openai_reasoning_effort(body, out);
-    out.preserve_thinking = parse_openai_preserve_thinking(body);
+    const OpenAIThinkingFlags thinking = parse_openai_thinking_flags(body, true);
+    out.enable_thinking   = thinking.enable_thinking;
+    out.preserve_thinking = thinking.preserve_thinking;
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }

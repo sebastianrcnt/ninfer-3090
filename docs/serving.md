@@ -80,7 +80,8 @@ The endpoint supports:
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
 - the top-level `reasoning_effort` field;
-- the `enable_thinking` extension;
+- the `enable_thinking` extension through its top-level field and its
+  `chat_template_kwargs.enable_thinking` spelling;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
@@ -97,13 +98,14 @@ not exposed by the loaded template returns HTTP 400 with code
 For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
 select the corresponding template effort when available. The other OpenAI protocol values
 `minimal`, `high`, and `max` are parsed but rejected when the loaded template does not expose them.
-`enable_thinking` controls the same new-turn thinking switch; a contradictory combination with
-`reasoning_effort` returns `conflicting_template_option`.
+`enable_thinking` controls the same new-turn thinking switch and accepts both its top-level field
+and the `chat_template_kwargs.enable_thinking` spelling used by llama.cpp- and vLLM-shaped clients;
+a contradictory combination with `reasoning_effort` returns `conflicting_template_option`.
 
 `preserve_thinking` controls whether reasoning from closed assistant turns remains in later
-prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. If
-both OpenAI spellings are present they must carry the same boolean value. Unknown non-null
-`chat_template_kwargs` are rejected.
+prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. For
+both thinking flags, if both spellings are present they must carry the same boolean value. Unknown
+non-null `chat_template_kwargs` are rejected.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty

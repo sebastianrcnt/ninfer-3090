@@ -23,7 +23,20 @@ namespace ninfer::serve {
 GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
                                                 const RequestLimits& limits);
 
-std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);
+// The two thinking flags accepted through both their top-level field and the
+// chat_template_kwargs spelling. Each pair must agree when both spellings are
+// present; a nullopt flag falls back to the server default.
+struct OpenAIThinkingFlags {
+    std::optional<bool> enable_thinking;
+    std::optional<bool> preserve_thinking;
+};
+
+// Parses both spellings of the thinking flags and rejects conflicts with
+// conflicting_template_option. Surfaces that do not declare an enable_thinking
+// spelling (the Responses API) pass false to keep rejecting it as an unknown
+// chat template option.
+OpenAIThinkingFlags parse_openai_thinking_flags(const nlohmann::json& body,
+                                                bool accept_enable_thinking);
 
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style
