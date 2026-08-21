@@ -743,6 +743,26 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         }
     }
 
+    if (impl->use_cuda_graph) {
+        // Every figure above is a per-lane bound multiplied by max_concurrency, but preparation
+        // also carries a fixed cost that no per-lane term captures. Measured on SM86 as the device
+        // free-memory delta: 36 MiB at max_concurrency 1, 44 MiB at 2, 50 MiB at 3 — roughly a
+        // 29 MiB base plus 7 MiB per lane, and the same 36 MiB at capacity 4,096 as at 262,144, so
+        // the base does not track graph content. A configuration whose per-lane number is small
+        // therefore plans under that base and start-up fails even though the graphs themselves fit:
+        // the ordinary path's flat 12 MiB per lane never started with graphs enabled at any
+        // capacity, and MTP at capacity <= 4,096 with a 2-token draft window planned 16 MiB against
+        // the same 36 MiB. Floor the total rather than patching each branch, since the base belongs
+        // to preparation as a whole. Configurations whose own bound already exceeds this keep it.
+        const std::size_t allowance_floor =
+            checked_add(40ULL * kMiB,
+                        checked_mul(8ULL * kMiB, impl->max_concurrency, "graph allowance per lane"),
+                        "graph allowance floor");
+        if (impl->graph_allowance_bytes < allowance_floor) {
+            impl->graph_allowance_bytes = allowance_floor;
+        }
+    }
+
     impl->device_reservation_bytes = checked_add(
         checked_add(
             checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
