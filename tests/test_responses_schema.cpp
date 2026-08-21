@@ -218,6 +218,12 @@ int test_preserve_thinking_options_and_inheritance() {
     failures += check(api_code([&] { (void)parse_responses_request(unknown, limits()); }) ==
                           "chat_template_option_not_supported",
                       "Responses unknown chat template option was accepted");
+
+    Json enable                    = base;
+    enable["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    failures += check(api_code([&] { (void)parse_responses_request(enable, limits()); }) ==
+                          "chat_template_option_not_supported",
+                      "Responses accepted the Chat-Completions-only enable_thinking spelling");
     return failures;
 }
 
