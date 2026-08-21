@@ -213,11 +213,18 @@ void check_preparation_control(Clock::time_point deadline,
 
 class ServiceOutputSink final : public ninfer::OutputSink {
 public:
-    ServiceOutputSink(const StreamSink& sink, bool filter_tool_calls)
-        : sink_(&sink), filter_tool_calls_(filter_tool_calls) {}
+    ServiceOutputSink(const StreamSink* sink, bool filter_tool_calls,
+                      std::function<void()> on_first_token)
+        : sink_(sink), filter_tool_calls_(filter_tool_calls),
+          on_first_token_(std::move(on_first_token)) {}
 
     void publish(ninfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
+        if (!first_token_seen_) {
+            first_token_seen_ = true;
+            if (on_first_token_) { on_first_token_(); }
+        }
+        if (sink_ == nullptr) { return; }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
             if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
         } else {
@@ -241,6 +248,8 @@ private:
 
     const StreamSink* sink_ = nullptr;
     bool filter_tool_calls_ = false;
+    std::function<void()> on_first_token_;
+    bool first_token_seen_ = false;
     ToolCallStreamFilter tool_filter_;
     std::size_t content_bytes_ = 0;
 };
@@ -415,10 +424,10 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
 
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
                                          std::function<bool()> is_cancelled) {
-    std::unique_ptr<ServiceOutputSink> output_sink;
-    if (sink != nullptr) {
-        output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared.tool_capable);
-    }
+    // Installed even without a StreamSink: a non-streaming request still has a prefill
+    // worth reporting, and the sink is the only place that sees the first token.
+    auto output_sink = std::make_unique<ServiceOutputSink>(sink, prepared.tool_capable,
+                                                           std::move(prepared.on_first_token));
     ninfer::OutputSink* public_sink = output_sink.get();
     ninfer::CancellationView cancellation;
     if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {

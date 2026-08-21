@@ -118,6 +118,14 @@ HttpServer::HttpServer(ServeOptions options)
     register_routes();
 }
 
+void HttpServer::attach_first_token_log(PreparedRequest& prepared,
+                                        const RequestLogContext& context) {
+    prepared.on_first_token = [this, context, submitted = std::chrono::steady_clock::now()] {
+        const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - submitted;
+        log_request_first_token(context, elapsed.count());
+    };
+}
+
 void HttpServer::log_line(const std::string& line) {
     write_console_log(ConsoleLogLevel::Info, line);
 }
@@ -125,6 +133,11 @@ void HttpServer::log_line(const std::string& line) {
 void HttpServer::log_request_start(const RequestLogContext& context) {
     log_line(format_request_start(context));
     request_jsonl_.write_request_start(context);
+}
+
+void HttpServer::log_request_first_token(const RequestLogContext& context,
+                                         double elapsed_seconds) {
+    log_line(format_request_first_token(context, elapsed_seconds));
 }
 
 void HttpServer::log_request_done(const RequestLogContext& context,
@@ -488,6 +501,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const RequestLogContext log_context =
         make_request_log_context(req_id, "openai_chat_completions", request, prepared);
     log_request_start(log_context);
+    attach_first_token_log(prepared, log_context);
 
     if (!request.stream) {
         try {
@@ -684,6 +698,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const RequestLogContext log_context =
         make_request_log_context(req_id, "anthropic_messages", request, prepared);
     log_request_start(log_context);
+    attach_first_token_log(prepared, log_context);
 
     if (!request.stream) {
         try {

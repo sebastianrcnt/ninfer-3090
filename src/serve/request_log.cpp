@@ -297,6 +297,16 @@ std::string format_request_start(const RequestLogContext& context) {
     return out.str();
 }
 
+// Wall time from the moment the request was logged as submitted, so it covers queueing as
+// well as prefill. The engine-measured ttft on the done line excludes the queue; the two
+// are named differently because they answer different questions.
+std::string format_request_first_token(const RequestLogContext& context, double elapsed_seconds) {
+    std::ostringstream out;
+    out << "[req " << context.id << "] first token elapsed=" << seconds_str(elapsed_seconds)
+        << " (queue+prefill) \xE2\x86\x92 decoding";
+    return out.str();
+}
+
 std::string format_request_done(const RequestLogContext& context,
                                 const GenerationOutcome& outcome) {
     const GenerationMetrics& metrics = outcome.metrics;

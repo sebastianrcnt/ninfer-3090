@@ -73,6 +73,10 @@ struct PreparedRequest {
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
+    // Fired once, when the first token reaches the sink. A long prefill is otherwise
+    // silent: nothing is logged between submission and completion, so a request part way
+    // through a 55K-token prompt is indistinguishable from a wedged server.
+    std::function<void()> on_first_token;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 

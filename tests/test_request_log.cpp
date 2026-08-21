@@ -267,6 +267,16 @@ int main() {
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
 
+    const std::string first_token = format_request_first_token(context, 21.02);
+    failures += check(first_token.find("first token") != std::string::npos,
+                      "human request log omits the first-token event");
+    failures += check(first_token.find("elapsed=21.02s") != std::string::npos,
+                      "first-token log omits the elapsed wall time");
+    failures += check(first_token.find("queue+prefill") != std::string::npos,
+                      "first-token log does not say what the elapsed time covers");
+    failures += check(first_token.find("[req 7]") != std::string::npos,
+                      "first-token log omits the request id");
+
     ThroughputReport throughput;
     throughput.interval_seconds                = 2.0;
     throughput.computed_prefill_tokens         = 100;
