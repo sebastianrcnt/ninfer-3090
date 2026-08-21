@@ -186,6 +186,12 @@ __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const
         charset_transition(has_charset_state ? charset_state : *c.charset_state, c, v) ==
             0xffffffffU) return -CUDART_INF_F;
     float x = raw;
+    // A greedy row is defined as the raw argmax and must stay bit-identical to argmax(); the
+    // public contract skips penalties, filters, RNG, and token_counts updates for it
+    // (include/ninfer/ops/sampling.h).  Applying them here made greedy pick a penalized token's
+    // rival whenever the two were otherwise tied.  The charset policy above is not a penalty --
+    // rejected candidates are excluded *before* argmax -- so it stays.
+    if (!(c.temperature > 0.0f)) { return x; }
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
     for (int j = 0; j < overlay_len; ++j) {
