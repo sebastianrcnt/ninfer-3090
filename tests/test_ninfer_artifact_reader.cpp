@@ -183,6 +183,35 @@ void test_common_validation() {
     }
 }
 
+void test_identity_build_id() {
+    // build_id arrived after the format shipped, so the reader must accept a directory that
+    // lacks it and one that carries it, while still refusing anything else in identity.
+    auto without = write_fixture(normative_directory(), "identity_without_build_id");
+    if (!Reader(without.path).identity().build_id.empty()) {
+        throw std::runtime_error("absent build_id should read as empty");
+    }
+
+    Json stamped                      = normative_directory();
+    stamped["identity"]["build_id"]   = "0123456789abcdef";
+    auto present = write_fixture(stamped, "identity_with_build_id");
+    if (Reader(present.path).identity().build_id != "0123456789abcdef") {
+        throw std::runtime_error("stamped build_id did not survive the reader");
+    }
+
+    Json foreign                    = normative_directory();
+    foreign["identity"]["surprise"] = "x";
+    auto rejected = write_fixture(foreign, "identity_with_foreign_member");
+    bool refused = false;
+    try {
+        Reader reader(rejected.path);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    if (!refused) {
+        throw std::runtime_error("an unknown identity member should still be refused");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -190,6 +219,7 @@ int main() {
         test_registered_sizes();
         test_normative_fixture();
         test_common_validation();
+        test_identity_build_id();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

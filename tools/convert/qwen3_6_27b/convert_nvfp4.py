@@ -19,6 +19,7 @@ from typing import Mapping, Sequence
 
 import torch
 
+from tools.artifact.build_id import stamp_build_id
 from tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactWriter
 from tools.artifact.layouts import (
     decode_nvfp4_words,
@@ -398,6 +399,11 @@ def convert(
                     f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
                     flush=True,
                 )
+
+    # The payload is final only once the writer has closed, and the digest covers the
+    # payload alone, so stamping is a separate pass rather than part of the write.
+    build_id = stamp_build_id(output)
+    print(f"build_id {build_id}", flush=True)
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size

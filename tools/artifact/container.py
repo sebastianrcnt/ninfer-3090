@@ -20,7 +20,8 @@ PAYLOAD_ALIGNMENT = 4096
 RAW_BYTES_V1 = "raw-bytes-v1"
 
 _ROOT_MEMBERS = frozenset({"identity", "objects"})
-_IDENTITY_MEMBERS = frozenset({"model_id", "weights_id"})
+_IDENTITY_REQUIRED_MEMBERS = frozenset({"model_id", "weights_id"})
+_IDENTITY_OPTIONAL_MEMBERS = frozenset({"build_id"})
 _TENSOR_MEMBERS = frozenset(
     {"name", "kind", "shape", "format", "layout", "offset", "bytes"}
 )
@@ -35,6 +36,9 @@ class ArtifactError(ValueError):
 class ArtifactIdentity:
     model_id: str
     weights_id: str
+    # Digest of the payload, stamped after the payload is final. Empty until then, and
+    # empty in artifacts written before the field existed; see tools/artifact/build_id.py.
+    build_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +188,9 @@ def _require_identity(identity: ArtifactIdentity) -> ArtifactIdentity:
     return ArtifactIdentity(
         model_id=_require_string(identity.model_id, "model_id"),
         weights_id=_require_string(identity.weights_id, "weights_id"),
+        build_id=(
+            _require_string(identity.build_id, "build_id") if identity.build_id else ""
+        ),
     )
 
 
@@ -193,11 +200,14 @@ def encode_directory(
     checked_identity = _require_identity(identity)
     if not objects:
         raise ArtifactError("objects must not be empty")
+    identity_value = {
+        "model_id": checked_identity.model_id,
+        "weights_id": checked_identity.weights_id,
+    }
+    if checked_identity.build_id:
+        identity_value["build_id"] = checked_identity.build_id
     value = {
-        "identity": {
-            "model_id": checked_identity.model_id,
-            "weights_id": checked_identity.weights_id,
-        },
+        "identity": identity_value,
         "objects": [obj.to_json() for obj in objects],
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -247,16 +257,20 @@ def parse_directory(
     if not isinstance(value, dict) or frozenset(value) != _ROOT_MEMBERS:
         raise ArtifactError("directory root must contain exactly identity and objects")
     raw_identity = value["identity"]
-    if (
-        not isinstance(raw_identity, dict)
-        or frozenset(raw_identity) != _IDENTITY_MEMBERS
+    if not isinstance(raw_identity, dict) or not (
+        _IDENTITY_REQUIRED_MEMBERS
+        <= frozenset(raw_identity)
+        <= _IDENTITY_REQUIRED_MEMBERS | _IDENTITY_OPTIONAL_MEMBERS
     ):
         raise ArtifactError(
-            "artifact identity must contain exactly model_id and weights_id"
+            "artifact identity must contain model_id and weights_id, "
+            "and at most build_id besides"
         )
+    raw_build_id = raw_identity.get("build_id", "")
     identity = ArtifactIdentity(
         model_id=_require_string(raw_identity["model_id"], "model_id"),
         weights_id=_require_string(raw_identity["weights_id"], "weights_id"),
+        build_id=_require_string(raw_build_id, "build_id") if raw_build_id else "",
     )
     raw_objects = value["objects"]
     if not isinstance(raw_objects, list) or not raw_objects:

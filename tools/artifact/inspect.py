@@ -17,6 +17,7 @@ def artifact_summary(artifact: Artifact) -> dict[str, object]:
         "path": str(artifact.path),
         "model_id": artifact.identity.model_id,
         "weights_id": artifact.identity.weights_id,
+        "build_id": artifact.identity.build_id,
         "file_bytes": artifact.file_bytes,
         "payload_offset": artifact.payload_offset,
         "objects": len(artifact.objects),

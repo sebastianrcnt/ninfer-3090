@@ -338,10 +338,19 @@ RuntimeStats Engine::runtime_stats() const {
 
 namespace {
 
-// The identity a slot file is validated against. weights_id moves with a re-quantized artifact
-// even when model_id does not, so both take part.
+// The identity a slot file is validated against. model_id and weights_id name the target -- the
+// architecture and the quantization recipe -- and are compile-time constants of the converter, so
+// two artifacts built from different checkpoints carry the same pair. build_id digests the payload
+// and is the only component that separates them. An artifact without one cannot be attributed to
+// the weights that produced it, so slot transfer is refused rather than performed against an
+// identity that would also accept a different model's cache.
 std::string slot_identity(const LoadSummary& load) {
-    return load.model_id + '/' + load.weights_id;
+    if (load.build_id.empty()) {
+        throw std::runtime_error(
+            "artifact carries no build_id, so a slot file cannot be bound to its weights; "
+            "stamp the artifact with tools/artifact/build_id.py and reload");
+    }
+    return load.model_id + '/' + load.weights_id + '/' + load.build_id;
 }
 
 } // namespace

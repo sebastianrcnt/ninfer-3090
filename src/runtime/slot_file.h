@@ -18,7 +18,10 @@ namespace ninfer::runtime {
 inline constexpr char kSlotFileMagic[8]        = {'N', 'I', 'N', 'F', 'S', 'L', 'O', 'T'};
 // v2 describes vision items inside the prefix identity blob; v1 files carried none and are
 // refused rather than read, since a v1 identity for a media prompt cannot exist.
-inline constexpr std::uint32_t kSlotFileFormat = 2;
+// v3 binds model_id_hash to the artifact's build_id as well. A v2 file's hash covers only the
+// target name, which every artifact of one architecture shares, so a v2 file cannot be shown to
+// have come from the weights now loaded. Refusing them is the point of the bump.
+inline constexpr std::uint32_t kSlotFileFormat = 3;
 
 // Trivially copyable and fixed-size; written verbatim ahead of the payload sections. Field order
 // is part of the format, so append rather than reorder and raise kSlotFileFormat when the meaning
