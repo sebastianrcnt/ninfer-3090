@@ -52,6 +52,9 @@ def main() -> None:
         else:
             print(f"model_id: {summary['model_id']}")
             print(f"weights_id: {summary['weights_id']}")
+            # Named explicitly when absent: a blank line for an unstamped artifact reads
+            # as a display bug rather than as the reason its slot files are refused.
+            print(f"build_id: {summary['build_id'] or '(unstamped)'}")
             print(
                 f"objects: {summary['objects']} "
                 f"({summary['tensors']} tensors, {summary['resources']} resources)"
