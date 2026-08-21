@@ -801,8 +801,9 @@ private:
 
     void remove_completed_slot(std::uint32_t lane) {
         // The request just finished; its retained lane state is the newest turn boundary of its
-        // conversation. Park it into the catalog before the slot is reused.
-        if (slots_[lane] != nullptr && (*slots_[lane]).conversation_id != 0) {
+        // conversation. Park it into the catalog before the slot is reused — including requests
+        // that started an uncatalogued conversation, whose record is created here.
+        if (conversations_ != nullptr && conversations_->enabled()) {
             park_retained_lane_conversation(lane);
         }
         slots_[lane].reset();
@@ -1022,7 +1023,10 @@ private:
                 selected_reuse = reuse;
             }
         }
-        if (selected) { return selected; }
+        // A resident match is authoritative: no cached checkpoint can exceed the live frontier
+        // of the conversation it belongs to. A zero-reuse selection still falls through so the
+        // host-RAM tier can offer a restored prefix instead.
+        if (selected && selected_reuse > 0) { return selected; }
 
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
@@ -1125,10 +1129,14 @@ private:
             request->conversation_id = choice.conversation;
         } else {
             // Continuing whatever lives on this lane keeps its catalog identity; a fresh
-            // FullReset starts an uncatalogued conversation that completion will register.
+            // FullReset starts an uncatalogued conversation that completion will register. The
+            // old state is parked above and its catalog identity dies with it here.
             request->conversation_id =
                 resident_reuse ? lane_conversation_[lane] : ConversationId{0};
-            if (!resident_reuse) { park_retained_lane_conversation(lane); }
+            if (!resident_reuse) {
+                park_retained_lane_conversation(lane);
+                lane_conversation_[lane] = 0;
+            }
         }
         if (choice.evict_retained) {
             for (std::uint32_t retained_lane = 0;

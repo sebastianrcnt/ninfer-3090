@@ -71,7 +71,9 @@ ProgramImplCore::capture_retained_lane_checkpoint(std::uint32_t lane,
         throw std::invalid_argument("conversation capture requires a retained lane");
     }
     const SequenceState& sequence = sequences[lane];
-    if (!sequence.kv || !sequence.turn_checkpoint.valid || sequence.mtp_draft_count != 0 ||
+    // The GPU's intra-prompt turn checkpoint is optional here: single-shot requests retain a
+    // complete conversation boundary without ever capturing one.
+    if (!sequence.kv || sequence.mtp_draft_count != 0 ||
         sequence.ledger.size() != sequence.execution_frontier + 1U ||
         sequence.prefix_identity.size() != sequence.ledger.size()) {
         throw std::logic_error("retained lane does not hold a complete turn boundary");
@@ -122,28 +124,29 @@ void ProgramImplCore::capture_lane_kv_payload(std::uint32_t lane,
     PagedKVPool& text_pool         = decoder->text_kv.pool();
     qwen3_6::PagedKVCache* backend = sequence.kv->backend ? backend_kv_cache() : nullptr;
 
-    // Pages are immutable once written, so a re-park copies only pages past the parked mark.
-    const auto stream_pages = [&](PagedKVPool& pool, const PagedKVAllocation& allocation,
-                                  std::vector<std::vector<runtime::ConversationKvPayload::PageBytes>>&
-                                      planes,
-                                  std::size_t& parked_pages) {
-        planes.clear();
-        planes.resize(pool.plane_count());
-        const std::size_t pages = allocation.page_ids().size();
-        for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
-            planes[plane].resize(pages);
-            const std::size_t begin = std::min(parked_pages, pages);
-            for (std::size_t p = begin; p < pages; ++p) {
-                auto buffer = std::make_shared<std::vector<std::byte>>(
-                    pool.page_group_bytes(plane));
-                pool.read_page_group(plane, allocation.page_ids()[p], buffer->data(),
-                                     device.stream);
-                planes[plane][p] = std::move(buffer);
+    // Pages are immutable once written, so a re-park copies only pages past the parked mark and
+    // keeps the already-captured page pointers for the unchanged prefix.
+    const auto stream_pages =
+        [&](PagedKVPool& pool, const PagedKVAllocation& allocation,
+            std::vector<std::vector<runtime::ConversationKvPayload::PageBytes>>& planes,
+            std::size_t& parked_pages) {
+            if (planes.size() != pool.plane_count()) { planes.assign(pool.plane_count(), {}); }
+            const std::size_t pages = allocation.page_ids().size();
+            for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+                auto& row = planes[plane];
+                row.resize(pages);
+                const std::size_t begin = std::min(parked_pages, pages);
+                for (std::size_t p = begin; p < pages; ++p) {
+                    auto buffer =
+                        std::make_shared<std::vector<std::byte>>(pool.page_group_bytes(plane));
+                    pool.read_page_group(plane, allocation.page_ids()[p], buffer->data(),
+                                         device.stream);
+                    row[p] = std::move(buffer);
+                }
             }
-        }
-        CUDA_CHECK(cudaStreamSynchronize(device.stream));
-        parked_pages = pages;
-    };
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+            parked_pages = pages;
+        };
 
     device.synchronize();
     payload.has_backend_kv        = backend != nullptr;

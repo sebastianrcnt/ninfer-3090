@@ -19,7 +19,9 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk             = 1024;
     // Small enough for CI-class GPUs; the payloads are tiny at this context size.
-    options.conversation_cache_ram_bytes = 256ULL << 20;
+    // Two parked snapshots cost ~160 MiB each (the GDN image dominates), so the budget
+    // must comfortably hold both alternating conversations.
+    options.conversation_cache_ram_bytes = 4ULL << 30;
     options.speculative.backend          = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens     = 3;
     options.speculative.proposal_head    = ninfer::ProposalHead::Optimized;
@@ -125,11 +127,21 @@ int exercise_durable_tier(const char* artifact, const std::filesystem::path& dir
         ninfer::Engine engine(options);
         turn                                     = run_turn(engine, prompt);
         if (turn.empty()) { return 1; }
-        // The writer is asynchronous: wait briefly for the snapshot to land.
-        for (int i = 0; i < 100 && std::filesystem::is_empty(directory); ++i) {
+        // The writer is asynchronous and the Engine destructor drains its queue, so the
+        // snapshot must exist as a complete .conv file once the engine is gone.
+        for (int i = 0; i < 100; ++i) {
+            bool have_snapshot = false;
+            for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+                have_snapshot = have_snapshot || entry.path().extension() == ".conv";
+            }
+            if (have_snapshot) { break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        if (std::filesystem::is_empty(directory)) {
+        bool snapshot_present = false;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            snapshot_present = snapshot_present || entry.path().extension() == ".conv";
+        }
+        if (!snapshot_present) {
             std::cerr << "durable tier wrote no snapshot file\n";
             return 1;
         }

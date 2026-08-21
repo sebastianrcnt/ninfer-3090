@@ -84,6 +84,8 @@ ConversationDiskCache::~ConversationDiskCache() noexcept {
     }
     cv_.notify_all();
     if (worker_.joinable()) { worker_.join(); }
+    // Recovery after a restart reads these files, so destruction drains every scheduled
+    // snapshot rather than dropping the last completed conversation.
 }
 
 std::filesystem::path ConversationDiskCache::path_for(const std::string& name) const {
@@ -133,7 +135,11 @@ void ConversationDiskCache::scan() {
                      checkpoint.linear_conv_bytes + checkpoint.linear_recurrent_bytes);
                 disk_entry.checkpoint_frontiers.push_back(checkpoint.frontier);
             }
+            // The map key owns the name; mirror it into the value so callers can resolve a
+            // file path from an entry alone.
+            for (auto& [key, value] : scanned) { value.name = key; }
             scanned.emplace(std::move(disk_entry.name), std::move(disk_entry));
+            for (auto& [key, value] : scanned) { value.name = key; }
         } catch (const std::exception&) {
             continue; // unreadable files are inert until they are overwritten or evicted.
         }
@@ -154,12 +160,15 @@ void ConversationDiskCache::worker_loop() {
         std::string name;
         {
             std::unique_lock lock(mutex_);
-            cv_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
-            if (stopping_) { return; }
+            cv_.wait(lock, [this] { return !pending_.empty() || stopping_; });
+            if (pending_.empty()) {
+                if (stopping_) { return; }
+                continue;
+            }
             // One coalesced write at a time; the newest pending snapshot per conversation wins.
-            auto it      = pending_.begin();
-            name         = it->first;
-            job          = std::move(it->second);
+            auto it = pending_.begin();
+            name    = it->first;
+            job     = std::move(it->second);
             pending_.erase(it);
         }
 
