@@ -64,6 +64,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
 
 // Compact console records retained for operator visibility.
 std::string format_request_start(const RequestLogContext& context);
+std::string format_request_first_token(const RequestLogContext& context, double elapsed_seconds);
 std::string format_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
 std::string format_request_error(const RequestLogContext& context, const std::string& message);
 std::string format_throughput(const ThroughputReport& report);

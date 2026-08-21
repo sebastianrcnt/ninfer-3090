@@ -237,6 +237,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     const RequestLogContext log_context =
         make_request_log_context(req_id, "openai_responses", request.generation, prepared);
     log_request_start(log_context);
+    attach_first_token_log(prepared, log_context);
 
     if (!request.stream) {
         try {

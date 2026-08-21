@@ -50,6 +50,8 @@ private:
     // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);
     void log_request_start(const RequestLogContext& context);
+    void attach_first_token_log(PreparedRequest& prepared, const RequestLogContext& context);
+    void log_request_first_token(const RequestLogContext& context, double elapsed_seconds);
     void log_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void log_request_error(const RequestLogContext& context, const std::string& message);
     void log_throughput(const ThroughputReport& report);
