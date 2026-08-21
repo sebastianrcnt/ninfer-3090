@@ -331,6 +331,27 @@ NINFER_WEIGHTS=out/qwen3_6_27b.ninfer
 
 ## Commits
 
+Create a commit only when the user requests one.
+
+Subject: Conventional Commit style with a concise lowercase type consistent with repository
+history (`feat`, `fix`, `perf`, `bench`, `test`, `build`, `refactor`, `docs`, `chore`), and
+the task identifier appended:
+
+```text
+feat(engine): cut over the registered target to native artifacts (#12)
+```
+
+Body: short prose (2-5 lines, wrapped at ~72 columns) that states why the change was made and,
+when a real decision was taken, why the rejected alternative lost. Do not narrate what the diff
+already shows. Separate subject, body, and footers with blank lines.
+
+Footers: `Closes #N` when the commit completes an issue. AI-assisted commits keep the repository
+owner as the author and mark the contribution in trailers only:
+
+```text
+Co-Authored-By: <tool name> <noreply address used by that tool>
+```
+
 ## Work tracking
 
 Every task must be identified as `issue/<number>`, including work that is delivered through a
@@ -341,13 +362,3 @@ When creating a GitHub issue, start from `.github/ISSUE_TEMPLATE/issue.md`. Keep
 as the problem allows: lead with the conclusion, delete optional sections that add no useful
 information, add more specific sections only when the issue needs them, and split a concern into a
 separate issue when it can be implemented and closed independently.
-
-Create a commit only when the user requests one. Use Conventional Commit-style subjects, for
-example:
-
-```text
-feat(engine): cut over the registered target to native artifacts
-```
-
-Use concise lowercase types consistent with repository history (`feat`, `fix`, `perf`, `bench`,
-`test`, `build`, `refactor`, `docs`, `chore`).
