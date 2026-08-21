@@ -27,6 +27,9 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    // Directory holding persisted KV slots. Empty disables /slots save and restore, matching
+    // llama.cpp, which refuses both unless the server was started with --slot-save-path.
+    std::string slot_save_path;
     std::uint32_t max_context              = 8192;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency          = 1;

@@ -3,6 +3,7 @@
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
 #include "ninfer/types.h"
+#include "runtime/slot_file.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
@@ -24,6 +25,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -188,6 +190,41 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const {
         std::lock_guard lock(stats_mutex_);
         return published_stats_;
+    }
+
+    // Slot persistence. execution_mutex_ excludes the worker's decode round; queue_mutex_ settles
+    // whether the lane is serving a request, which is the one state these must refuse — the file
+    // would otherwise capture a sequence mid-round, or overwrite one that is still generating.
+    [[nodiscard]] runtime::SlotTransferResult save_slot(std::uint32_t lane, const std::string& path,
+                                                        std::string_view identity) {
+        std::scoped_lock lock(execution_mutex_);
+        require_idle_lane(lane, "save");
+        return instance_.program->save_retained_lane(lane, path, identity);
+    }
+
+    [[nodiscard]] runtime::SlotTransferResult
+    restore_slot(std::uint32_t lane, const std::string& path, std::string_view identity) {
+        std::scoped_lock lock(execution_mutex_);
+        require_idle_lane(lane, "restore");
+        return instance_.program->restore_retained_lane(lane, path, identity);
+    }
+
+    [[nodiscard]] std::uint32_t erase_slot(std::uint32_t lane) {
+        std::scoped_lock lock(execution_mutex_);
+        require_idle_lane(lane, "erase");
+        return instance_.program->erase_retained_lane(lane);
+    }
+
+    [[nodiscard]] std::uint32_t slot_count() const noexcept { return max_concurrency_; }
+
+    // Reports the retained token count per lane for GET /slots.
+    [[nodiscard]] std::vector<std::uint32_t> slot_token_counts() const {
+        std::scoped_lock lock(execution_mutex_);
+        std::vector<std::uint32_t> out(max_concurrency_, 0);
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            out[lane] = instance_.program->retained_token_count_lane(lane);
+        }
+        return out;
     }
 
     void reset_memory_peaks() noexcept {
@@ -1152,6 +1189,17 @@ private:
                 fail_all(std::current_exception());
                 return;
             }
+        }
+    }
+
+    void require_idle_lane(std::uint32_t lane, const char* action) const {
+        if (lane >= max_concurrency_) {
+            throw std::out_of_range(std::string("slot ") + action + ": lane is out of range");
+        }
+        std::lock_guard queue_lock(queue_mutex_);
+        if (slots_[lane] != nullptr) {
+            throw std::invalid_argument(std::string("slot ") + action +
+                                        ": lane is serving a request");
         }
     }
 

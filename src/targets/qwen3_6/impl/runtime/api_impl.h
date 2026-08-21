@@ -209,6 +209,30 @@ bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
 }
 
 template <>
+ninfer::runtime::SlotTransferResult
+Program<Variant>::save_retained_lane(std::uint32_t lane, const std::string& path,
+                                     std::string_view identity) {
+    return impl_->save_retained_lane(lane, path, identity);
+}
+
+template <>
+ninfer::runtime::SlotTransferResult
+Program<Variant>::restore_retained_lane(std::uint32_t lane, const std::string& path,
+                                        std::string_view identity) {
+    return impl_->restore_retained_lane(lane, path, identity);
+}
+
+template <>
+std::uint32_t Program<Variant>::erase_retained_lane(std::uint32_t lane) noexcept {
+    return impl_->erase_retained_lane(lane);
+}
+
+template <>
+std::uint32_t Program<Variant>::retained_token_count_lane(std::uint32_t lane) const noexcept {
+    return impl_->retained_token_count_lane(lane);
+}
+
+template <>
 void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
     impl_->evict_retained_lane(lane);
 }

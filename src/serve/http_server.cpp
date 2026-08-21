@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -253,6 +254,12 @@ void HttpServer::register_routes() {
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
+    server_.Get("/slots", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_slots(req, res);
+    });
+    server_.Post(R"(/slots/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_slot_action(req, res);
+    });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -297,6 +304,129 @@ void HttpServer::register_routes() {
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
+}
+
+namespace {
+
+// llama.cpp refuses anything that could escape --slot-save-path, so a filename is a single path
+// component with no separators and no dot segments. The check is on the request string rather
+// than the resolved path: rejecting the input is easier to reason about than proving a
+// canonicalized path stayed inside the directory.
+bool is_plain_filename(std::string_view filename) {
+    if (filename.empty() || filename.size() > 255 || filename == "." || filename == "..") {
+        return false;
+    }
+    if (filename.find('/') != std::string_view::npos ||
+        filename.find('\\') != std::string_view::npos ||
+        filename.find('\0') != std::string_view::npos) {
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+void HttpServer::handle_slots(const httplib::Request&, httplib::Response& res) const {
+    nlohmann::json slots = nlohmann::json::array();
+    const std::vector<std::uint32_t> tokens = service_->slot_token_counts();
+    for (std::size_t id = 0; id < tokens.size(); ++id) {
+        slots.push_back(nlohmann::json{
+            {"id", id},
+            {"n_ctx", tokens[id]},
+            {"is_processing", false},
+        });
+    }
+    res.set_content(slots.dump(), "application/json");
+}
+
+void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Response& res) {
+    ApiError error;
+    error.type = "invalid_request_error";
+
+    const std::string action = req.get_param_value("action");
+    if (action != "save" && action != "restore" && action != "erase") {
+        error.status  = 400;
+        error.message = "slot action must be one of save, restore, erase";
+        write_error(res, error);
+        return;
+    }
+
+    std::uint32_t slot = 0;
+    try {
+        const unsigned long parsed = std::stoul(req.matches[1].str());
+        if (parsed >= service_->slot_count()) { throw std::out_of_range("slot"); }
+        slot = static_cast<std::uint32_t>(parsed);
+    } catch (const std::exception&) {
+        error.status  = 400;
+        error.message = "slot id is out of range";
+        write_error(res, error);
+        return;
+    }
+
+    if (action == "erase") {
+        try {
+            const std::uint32_t erased = service_->erase_slot(slot);
+            res.set_content(nlohmann::json{{"id_slot", slot}, {"n_erased", erased}}.dump(),
+                            "application/json");
+        } catch (const std::exception& ex) {
+            error.status  = 400;
+            error.message = ex.what();
+            write_error(res, error);
+        }
+        return;
+    }
+
+    if (options_.slot_save_path.empty()) {
+        error.status  = 501;
+        error.message = "This server does not support slots save/restore. "
+                        "Start it with --slot-save-path";
+        write_error(res, error);
+        return;
+    }
+
+    std::string filename;
+    try {
+        const nlohmann::json body = nlohmann::json::parse(req.body);
+        filename                  = body.at("filename").get<std::string>();
+    } catch (const std::exception&) {
+        error.status  = 400;
+        error.message = "request body must be a JSON object with a filename";
+        write_error(res, error);
+        return;
+    }
+    if (!is_plain_filename(filename)) {
+        error.status  = 400;
+        error.message = "filename must be a single path component";
+        write_error(res, error);
+        return;
+    }
+
+    const std::string path =
+        (std::filesystem::path(options_.slot_save_path) / filename).string();
+    try {
+        if (action == "save") {
+            std::filesystem::create_directories(options_.slot_save_path);
+            const ninfer::SlotTransfer result = service_->save_slot(slot, path);
+            res.set_content(nlohmann::json{{"id_slot", slot},
+                                           {"filename", filename},
+                                           {"n_saved", result.tokens},
+                                           {"n_written", result.bytes}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
+        const ninfer::SlotTransfer result = service_->restore_slot(slot, path);
+        res.set_content(nlohmann::json{{"id_slot", slot},
+                                       {"filename", filename},
+                                       {"n_restored", result.tokens},
+                                       {"n_read", result.bytes}}
+                            .dump(),
+                        "application/json");
+    } catch (const std::exception& ex) {
+        error.status  = 400;
+        error.message = ex.what();
+        write_error(res, error);
+    }
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {

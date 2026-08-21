@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace ninfer {
 
@@ -53,6 +55,13 @@ private:
     friend class Engine;
 };
 
+// Byte and token totals for one slot transfer; the HTTP layer renders these as llama.cpp's
+// n_saved/n_written and n_restored/n_read.
+struct SlotTransfer {
+    std::uint32_t tokens = 0;
+    std::uint64_t bytes  = 0;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -90,6 +99,15 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     void reset_memory_peaks() noexcept;
+
+    // Persisted KV slots, matching llama.cpp's /slots surface. A slot is one request lane; the
+    // lane must not be serving a request, and restore refuses a file written for another model,
+    // KV format, or speculative backend rather than reinterpreting its bytes.
+    [[nodiscard]] std::uint32_t slot_count() const;
+    [[nodiscard]] std::vector<std::uint32_t> slot_token_counts() const;
+    SlotTransfer save_slot(std::uint32_t slot, const std::string& path);
+    SlotTransfer restore_slot(std::uint32_t slot, const std::string& path);
+    std::uint32_t erase_slot(std::uint32_t slot);
 
 private:
     class Impl;

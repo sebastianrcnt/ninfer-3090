@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -143,6 +144,70 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
         if (!same_item(prompt.vision_items[i], vision_items_[i])) { return false; }
     }
     return true;
+}
+
+namespace {
+
+// Length-prefixed vectors, little-endian host order. The file never leaves the machine that wrote
+// it — a restore already refuses on model and KV-format mismatch — so no byte-order conversion.
+template <typename T>
+void append_vector(std::vector<std::byte>& out, const std::vector<T>& values) {
+    const std::uint64_t count = values.size();
+    const auto* count_bytes   = reinterpret_cast<const std::byte*>(&count);
+    out.insert(out.end(), count_bytes, count_bytes + sizeof(count));
+    if (values.empty()) { return; }
+    const auto* payload = reinterpret_cast<const std::byte*>(values.data());
+    out.insert(out.end(), payload, payload + values.size() * sizeof(T));
+}
+
+template <typename T>
+void read_vector(std::span<const std::byte>& cursor, std::vector<T>& values) {
+    std::uint64_t count = 0;
+    if (cursor.size() < sizeof(count)) {
+        throw std::invalid_argument("prefix identity payload is truncated");
+    }
+    std::memcpy(&count, cursor.data(), sizeof(count));
+    cursor = cursor.subspan(sizeof(count));
+    const std::size_t bytes = static_cast<std::size_t>(count) * sizeof(T);
+    if (count > cursor.size() / sizeof(T)) {
+        throw std::invalid_argument("prefix identity payload is truncated");
+    }
+    values.resize(static_cast<std::size_t>(count));
+    if (count != 0) { std::memcpy(values.data(), cursor.data(), bytes); }
+    cursor = cursor.subspan(bytes);
+}
+
+} // namespace
+
+std::vector<std::byte> ResidentPrefixIdentity::serialize() const {
+    if (carries_vision()) {
+        throw std::invalid_argument("prefix identity carries vision items, which slot "
+                                    "persistence does not describe yet");
+    }
+    std::vector<std::byte> out;
+    append_vector(out, token_types_);
+    for (const std::vector<std::int32_t>& axis : positions_) { append_vector(out, axis); }
+    return out;
+}
+
+void ResidentPrefixIdentity::deserialize(std::span<const std::byte> bytes) {
+    clear();
+    try {
+        std::span<const std::byte> cursor = bytes;
+        read_vector(cursor, token_types_);
+        for (std::vector<std::int32_t>& axis : positions_) { read_vector(cursor, axis); }
+        if (!cursor.empty()) {
+            throw std::invalid_argument("prefix identity payload has trailing bytes");
+        }
+        for (const std::vector<std::int32_t>& axis : positions_) {
+            if (axis.size() != token_types_.size()) {
+                throw std::invalid_argument("prefix identity axes disagree with token count");
+            }
+        }
+    } catch (...) {
+        clear();
+        throw;
+    }
 }
 
 bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
