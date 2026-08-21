@@ -337,6 +337,11 @@ Every task must be identified as `issue/<number>`, including work that is delive
 pull request (branch names drop the `#`: `issue/15`). Use that identifier consistently in branch names, commit messages, pull-request
 titles and descriptions, status reports, and other task-facing records.
 
+When creating a GitHub issue, start from `.github/ISSUE_TEMPLATE/issue.md`. Keep the issue as small
+as the problem allows: lead with the conclusion, delete optional sections that add no useful
+information, add more specific sections only when the issue needs them, and split a concern into a
+separate issue when it can be implemented and closed independently.
+
 Create a commit only when the user requests one. Use Conventional Commit-style subjects, for
 example:
 
