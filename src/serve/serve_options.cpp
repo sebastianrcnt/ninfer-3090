@@ -313,6 +313,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("--default-max-tokens must be positive");
         }
     }
+    if (options.conversation_cache_ram_bytes != 0 && !options.allow_prefix_reuse) {
+        throw std::invalid_argument(
+            "--no-prefix-reuse and the conversation cache contradict each other; the cache only "
+            "extends prefix reuse to conversations that left the lane");
+    }
     if (!options.conversation_cache_dir.empty()) {
         if (options.conversation_cache_disk_bytes == 0) {
             throw std::invalid_argument(

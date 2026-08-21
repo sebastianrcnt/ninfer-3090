@@ -693,7 +693,11 @@ private:
     // everything already resident on the GPU. Returns true when a lane changed, so the caller
     // re-plans against it.
     bool hydrate_head_conversation(const std::shared_ptr<Request>& request) {
-        if (conversations_ == nullptr) { return false; }
+        // A request that opted out of prefix reuse would plan FullReset against whatever was
+        // restored, so restoring for it would only spend the transfer.
+        if (conversations_ == nullptr || !request->options.execution.allow_prefix_reuse) {
+            return false;
+        }
         std::uint32_t best_resident = 0;
         bool have_free              = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {

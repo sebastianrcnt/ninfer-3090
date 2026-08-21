@@ -500,6 +500,8 @@ capacity, page geometry, speculative backend, section sizes, and the exact end o
 any device memory is touched, and refuses everything else rather than reinterpreting its bytes.
 Files this build cannot use are removed from the cache directory, which the server owns
 exclusively; `--conversation-cache-dir` must not point at a directory holding anything else.
+`--no-prefix-reuse` and a conversation-cache budget contradict each other and are refused at
+startup: the cache exists to extend prefix reuse to conversations that have left the lane.
 
 A configuration for one owner alternating between long conversations on a single GPU:
 

@@ -75,6 +75,12 @@ int main() {
                      "--conversation-cache-disk-mib", "1024"});
     } catch (const std::exception&) { refused = true; }
     failures += check(refused, "a durable conversation tier without a hot budget was accepted");
+    refused = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--conversation-cache-ram-mib", "1024",
+                     "--no-prefix-reuse"});
+    } catch (const std::exception&) { refused = true; }
+    failures += check(refused, "the conversation cache was accepted with prefix reuse disabled");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");
