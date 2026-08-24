@@ -91,14 +91,15 @@ text remains in `content`.
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
-`medium`, and `xhigh`; omitting effort uses that template's declared default. An effort that
-resolves to a level the loaded template does not expose returns HTTP 400 with code
-`reasoning_effort_not_supported` before prompt preparation.
+`medium`, and `xhigh`. An effort that resolves to a level the loaded template does not expose
+returns HTTP 400 with code `reasoning_effort_not_supported` before prompt preparation.
 
 For Chat Completions, `reasoning_effort: "none"` disables thinking. The protocol's six thinking
 levels fold onto the three a template exposes, in order, so that a higher request never selects a
 lower effort: `minimal` and `low` select `low`, `medium` and `high` select `medium`, and `xhigh`
-and `max` select `xhigh`.
+and `max` select `xhigh`. The selected level does not change the rendered prompt: no effort
+instruction is injected, so every level produces identical bytes and switching levels mid-conversation
+costs no prefix reuse. `enable_thinking` is the option that does change the prompt.
 `enable_thinking` controls the same new-turn thinking switch and accepts both its top-level field
 and the `chat_template_kwargs.enable_thinking` spelling used by llama.cpp- and vLLM-shaped clients;
 a contradictory combination with `reasoning_effort` returns `conflicting_template_option`.
@@ -188,7 +189,7 @@ wire response contains typed `output` Items.
 | `temperature` | finite number in `[0,2]` |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
-| `reasoning.effort` | `none` disables thinking; the six thinking levels fold onto the three a template exposes: `minimal`/`low` select `low`, `medium`/`high` select `medium`, and `xhigh`/`max` select `xhigh` |
+| `reasoning.effort` | `none` disables thinking; the six thinking levels fold onto the three a template exposes: `minimal`/`low` select `low`, `medium`/`high` select `medium`, and `xhigh`/`max` select `xhigh`; the selected level does not alter the rendered prompt |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |

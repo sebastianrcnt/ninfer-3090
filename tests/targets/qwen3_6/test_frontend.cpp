@@ -282,7 +282,7 @@ int test_official_chat_template() {
     failures +=
         check(render_chat_text({chat_message("user", "hi"), tool_assistant}, no_generation) ==
                   "<|im_start|>user\nhi<|im_end|>\n"
-                  "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                  "<|im_start|>assistant\n"
                   "<tool_call>\n<function=f>\n<parameter=flag>\ntrue\n</parameter>\n"
                   "<parameter=nested>\n{\"x\": [1, 2]}\n</parameter>\n"
                   "</function>\n</tool_call><|im_end|>\n",
@@ -355,47 +355,48 @@ int test_official_chat_template() {
 }
 
 int test_reasoning_effort_chat_template() {
-    constexpr std::string_view low_instructions =
-        "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly "
-        "to the conclusion without unnecessary elaboration.";
-    constexpr std::string_view xhigh_instructions =
-        "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
-        "assumptions, consider plausible alternatives, and prioritize correctness, consistency, "
-        "and clarity in the final answer.";
-
     const ninfer::PromptCapabilities toggle_capabilities =
         thinking_toggle_template().capabilities();
     const ninfer::PromptCapabilities effort_capabilities =
         reasoning_effort_template().capabilities();
     int failures = check(toggle_capabilities.enable_thinking &&
-                             !toggle_capabilities.reasoning_effort.default_effort &&
                              !toggle_capabilities.reasoning_effort.low &&
                              !toggle_capabilities.reasoning_effort.medium &&
                              !toggle_capabilities.reasoning_effort.xhigh,
                          "thinking-toggle template advertised reasoning effort");
-    failures += check(
-        effort_capabilities.enable_thinking && effort_capabilities.reasoning_effort.low &&
-            effort_capabilities.reasoning_effort.medium &&
-            effort_capabilities.reasoning_effort.xhigh &&
-            effort_capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
-        "reasoning-effort template did not advertise its complete capability set");
+    failures += check(effort_capabilities.enable_thinking &&
+                          effort_capabilities.reasoning_effort.low &&
+                          effort_capabilities.reasoning_effort.medium &&
+                          effort_capabilities.reasoning_effort.xhigh,
+                      "reasoning-effort template did not advertise its complete capability set");
 
-    const auto render_effort = [](ninfer::ReasoningEffort effort) {
-        fi::ChatRenderOptions options;
-        options.reasoning_effort = effort;
+    // Every level renders the same bytes: that invariance is the contract, not the text of
+    // any one level.
+    const auto render_with = [](fi::ChatRenderOptions options) {
         return reasoning_effort_template().render({chat_message("user", "hello")}, options).text;
     };
     const std::string tail = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n";
-    failures +=
-        check(reasoning_effort_template().render({chat_message("user", "hello")}).text ==
-                  "<|im_start|>system\n" + std::string(xhigh_instructions) + "<|im_end|>\n" + tail,
-              "reasoning-effort template did not apply its xhigh default");
-    failures +=
-        check(render_effort(ninfer::ReasoningEffort::Low) ==
-                  "<|im_start|>system\n" + std::string(low_instructions) + "<|im_end|>\n" + tail,
-              "low reasoning effort did not render the official instruction");
-    failures += check(render_effort(ninfer::ReasoningEffort::Medium) == tail,
-                      "medium reasoning effort injected an instruction");
+    failures += check(render_with(fi::ChatRenderOptions{}) == tail,
+                      "an effort-free render emitted a system block");
+
+    fi::ChatRenderOptions tool_options;
+    tool_options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object"}}})");
+    const std::string tools_baseline = render_with(tool_options);
+
+    for (const ninfer::ReasoningEffort effort :
+         {ninfer::ReasoningEffort::Low, ninfer::ReasoningEffort::Medium,
+          ninfer::ReasoningEffort::XHigh}) {
+        fi::ChatRenderOptions plain;
+        plain.reasoning_effort = effort;
+        failures += check(render_with(plain) == tail,
+                          "reasoning effort changed the rendered prompt");
+
+        fi::ChatRenderOptions with_tools = tool_options;
+        with_tools.reasoning_effort      = effort;
+        failures += check(render_with(with_tools) == tools_baseline,
+                          "reasoning effort changed the rendered prompt ahead of the tools block");
+    }
 
     fi::ChatRenderOptions disabled;
     disabled.enable_thinking = false;
@@ -441,6 +442,15 @@ int test_reasoning_effort_chat_template() {
                               no_generation)
                       .text.find("old thought") == std::string::npos,
               "explicit preserve_thinking=false did not remove prior thinking");
+
+    fi::ChatMessage no_reasoning = chat_message("assistant", "plain answer");
+    fi::ChatRenderOptions keep_history;
+    keep_history.add_generation_prompt = false;
+    keep_history.preserve_thinking     = true;
+    failures += check(reasoning_effort_template()
+                              .render({chat_message("user", "q"), no_reasoning}, keep_history)
+                              .text.find("<think>") == std::string::npos,
+                      "a closed turn with no reasoning rendered an empty think block");
 
     fi::ChatMessage empty_arguments = chat_message("assistant", "");
     empty_arguments.tool_calls.push_back({.id = "", .name = "f", .arguments_json = ""});
@@ -531,8 +541,7 @@ int test_official_resource_guards() {
     const ninfer::PromptCapabilities capabilities = effort_frontend.prompt_capabilities();
     failures +=
         check(capabilities.reasoning_effort.low && capabilities.reasoning_effort.medium &&
-                  capabilities.reasoning_effort.xhigh &&
-                  capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
+                  capabilities.reasoning_effort.xhigh,
               "Frontend did not expose capabilities from its loaded chat template");
 
     return failures;
