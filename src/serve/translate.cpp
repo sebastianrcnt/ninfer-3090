@@ -139,23 +139,22 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         return result;
     }
 
+    // The protocol ladder carries six thinking levels; a template exposes three. Fold the
+    // former onto the latter in order, so that a higher request never resolves to a lower
+    // effort and every value the schema accepts is servable.
     switch (requested) {
+    case RequestedReasoningEffort::Minimal:
     case RequestedReasoningEffort::Low:
         result.reasoning_effort = ninfer::ReasoningEffort::Low;
         break;
     case RequestedReasoningEffort::Medium:
+    case RequestedReasoningEffort::High:
         result.reasoning_effort = ninfer::ReasoningEffort::Medium;
         break;
     case RequestedReasoningEffort::XHigh:
+    case RequestedReasoningEffort::Max:
         result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
         break;
-    case RequestedReasoningEffort::Minimal:
-    case RequestedReasoningEffort::High:
-    case RequestedReasoningEffort::Max:
-        invalid_prompt_option("reasoning effort '" +
-                                  std::string(requested_reasoning_effort_name(requested)) +
-                                  "' is not supported by the loaded chat template",
-                              request.reasoning_effort_param, "reasoning_effort_not_supported");
     case RequestedReasoningEffort::None:
         break;
     }
