@@ -46,9 +46,13 @@ struct RequestLimits {
     int default_max_tokens = 8192;
 };
 
+// prompt_tokens and completion_tokens are totals: cached_tokens is part of the former and
+// reasoning_tokens part of the latter, which is what a consumer subtracting them expects.
 struct CompletionUsage {
     int prompt_tokens     = 0;
     int completion_tokens = 0;
+    int cached_tokens     = 0;
+    int reasoning_tokens  = 0;
 };
 
 enum class ContentKind {

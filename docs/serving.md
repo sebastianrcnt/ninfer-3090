@@ -113,6 +113,16 @@ Streaming begins with an assistant-role chunk, sends separate reasoning and cont
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage.
 
+`usage` carries `prompt_tokens_details.cached_tokens` and
+`completion_tokens_details.reasoning_tokens` on both the non-streaming response and that final
+streaming chunk. Both are always present, and zero when nothing was reused or no reasoning was
+produced. Each is a component of its total rather than a separate quantity: `prompt_tokens`
+includes the cached prefix and `completion_tokens` includes the reasoning tokens, so newly
+computed input is `prompt_tokens - cached_tokens`. `cache_write_tokens` is deliberately absent.
+A completed request boundary is always retained, so the tokens written to the cache are exactly
+the tokens newly computed; reporting them would drive a consumer's
+`prompt_tokens - cached_tokens - cache_write_tokens` to zero on every request.
+
 ### Multimodal request
 
 Start the server with `--vision` before sending media:

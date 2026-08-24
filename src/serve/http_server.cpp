@@ -8,6 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <exception>
@@ -20,6 +21,16 @@
 
 namespace ninfer::serve {
 namespace {
+
+CompletionUsage completion_usage(const GenerationOutcome& outcome) {
+    return CompletionUsage{
+        .prompt_tokens     = outcome.prompt_tokens,
+        .completion_tokens = outcome.completion_tokens,
+        .cached_tokens     = std::clamp(static_cast<int>(outcome.metrics.prefix_cache_hit_tokens),
+                                        0, outcome.prompt_tokens),
+        .reasoning_tokens  = outcome.reasoning_tokens,
+    };
+}
 
 struct StreamingRequest {
     explicit StreamingRequest(PreparedRequest request) : prepared(std::move(request)) {}
@@ -408,7 +419,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = completion_usage(outcome);
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
@@ -493,7 +504,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                               include_usage));
                 }
                 if (include_usage) {
-                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+                    const CompletionUsage usage = completion_usage(outcome);
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_usage(id, model, created, usage));
                 }
@@ -606,7 +617,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = completion_usage(outcome);
             const char* stop_reason =
                 messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
             set_owned_content(res,
