@@ -275,14 +275,23 @@ int test_reasoning_effort() {
                           std::string("Chat Completions did not accept protocol effort ") + wire);
     }
 
-    Json high                            = base;
-    high["reasoning_effort"]             = "high";
-    const GenerationRequest high_request = parse_chat_completion_request(high, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "protocol-valid high effort was not rejected by template capability");
+    for (const auto& [wire, expected] :
+         std::array<std::pair<const char*, ninfer::ReasoningEffort>, 6>{
+             {{"minimal", ninfer::ReasoningEffort::Low},
+              {"low", ninfer::ReasoningEffort::Low},
+              {"medium", ninfer::ReasoningEffort::Medium},
+              {"high", ninfer::ReasoningEffort::Medium},
+              {"xhigh", ninfer::ReasoningEffort::XHigh},
+              {"max", ninfer::ReasoningEffort::XHigh}}}) {
+        Json folded                            = base;
+        folded["reasoning_effort"]             = wire;
+        const ninfer::PromptInput folded_prompt =
+            translate(parse_chat_completion_request(folded, default_limits()));
+        failures += check(folded_prompt.options.enable_thinking &&
+                              folded_prompt.options.reasoning_effort == expected,
+                          std::string("Chat Completions did not fold protocol effort ") + wire +
+                              " onto the template ladder");
+    }
 
     ninfer::PromptCapabilities toggle_capabilities;
     toggle_capabilities.enable_thinking = true;

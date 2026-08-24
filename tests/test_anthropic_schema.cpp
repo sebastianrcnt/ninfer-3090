@@ -463,14 +463,13 @@ int test_reasoning_effort() {
                           low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
                       "Anthropic low effort did not reach PromptInput");
 
-    Json high                            = base;
-    high["output_config"]                = Json{{"effort", "high"}};
-    const GenerationRequest high_request = parse_messages_request(high, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "Anthropic high effort bypassed template capability validation");
+    Json high                             = base;
+    high["output_config"]                 = Json{{"effort", "high"}};
+    const ninfer::PromptInput high_prompt = translate(parse_messages_request(high,
+                                                                            default_limits()));
+    failures += check(high_prompt.options.enable_thinking &&
+                          high_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "Anthropic high effort did not fold onto the template ladder");
 
     Json conflict        = low;
     conflict["thinking"] = Json{{"type", "disabled"}};
