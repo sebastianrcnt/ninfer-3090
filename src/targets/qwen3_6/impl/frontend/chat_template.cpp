@@ -25,15 +25,6 @@ constexpr Sha256Digest kReasoningEffortTemplateDigest{
     0xd3, 0xe2, 0xa7, 0x25, 0xb6, 0xc2, 0x58, 0x6a, 0xaa, 0x3a, 0x8a, 0xf9, 0xd7, 0xa8, 0x10, 0x41,
 };
 
-constexpr std::string_view kLowReasoningInstructions =
-    "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
-    "the conclusion without unnecessary elaboration.";
-
-constexpr std::string_view kXHighReasoningInstructions =
-    "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
-    "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
-    "clarity in the final answer.";
-
 bool is_allowed_role(const std::string& role) {
     return role == "system" || role == "user" || role == "assistant" || role == "tool";
 }
@@ -192,14 +183,9 @@ std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
 }
 
 std::string render_tools_system_block(const std::vector<std::string>& tool_jsons,
-                                      const std::string& merged_system,
-                                      std::string_view reasoning_instructions) {
+                                      const std::string& merged_system) {
     std::string rendered;
     rendered += "<|im_start|>system\n";
-    if (!reasoning_instructions.empty()) {
-        rendered += reasoning_instructions;
-        rendered += "\n\n";
-    }
     rendered += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     for (const std::string& tool : tool_jsons) {
         rendered += "\n";
@@ -215,31 +201,17 @@ std::string render_tools_system_block(const std::vector<std::string>& tool_jsons
     return rendered;
 }
 
-std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
-                                                const ChatRenderOptions& options) {
-    if (semantics == ChatTemplateSemantics::ThinkingToggle) {
-        if (options.reasoning_effort) {
-            throw std::invalid_argument("loaded chat template does not support reasoning effort");
-        }
-        return {};
+// The effort a request selects no longer reaches the rendered prompt: every level produces
+// the same bytes, so a level change costs no prefix. What remains is the two combinations
+// the template cannot represent at all.
+void validate_reasoning_options(ChatTemplateSemantics semantics,
+                                const ChatRenderOptions& options) {
+    if (semantics == ChatTemplateSemantics::ThinkingToggle && options.reasoning_effort) {
+        throw std::invalid_argument("loaded chat template does not support reasoning effort");
     }
-    if (!options.enable_thinking) {
-        if (options.reasoning_effort) {
-            throw std::invalid_argument(
-                "reasoning effort cannot be combined with disabled thinking");
-        }
-        return {};
+    if (!options.enable_thinking && options.reasoning_effort) {
+        throw std::invalid_argument("reasoning effort cannot be combined with disabled thinking");
     }
-
-    switch (options.reasoning_effort.value_or(ReasoningEffort::XHigh)) {
-    case ReasoningEffort::Low:
-        return kLowReasoningInstructions;
-    case ReasoningEffort::Medium:
-        return {};
-    case ReasoningEffort::XHigh:
-        return kXHighReasoningInstructions;
-    }
-    throw std::invalid_argument("invalid reasoning effort");
 }
 
 } // namespace
@@ -294,10 +266,9 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
     PromptCapabilities result;
     result.enable_thinking = true;
     if (semantics_ == ChatTemplateSemantics::ReasoningEffort) {
-        result.reasoning_effort.low            = true;
-        result.reasoning_effort.medium         = true;
-        result.reasoning_effort.xhigh          = true;
-        result.reasoning_effort.default_effort = ReasoningEffort::XHigh;
+        result.reasoning_effort.low    = true;
+        result.reasoning_effort.medium = true;
+        result.reasoning_effort.xhigh  = true;
     }
     return result;
 }
@@ -307,8 +278,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
 
     const bool effort_template = semantics_ == ChatTemplateSemantics::ReasoningEffort;
-    const std::string_view reasoning_instructions =
-        resolve_reasoning_instructions(semantics_, options);
+    validate_reasoning_options(semantics_, options);
 
     std::size_t num_sys = 0;
     std::string merged_system;
@@ -325,21 +295,10 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     std::string rendered;
     const bool has_tools = !options.tool_jsons.empty();
     if (has_tools) {
-        rendered +=
-            render_tools_system_block(options.tool_jsons, merged_system, reasoning_instructions);
-    } else if (num_sys != 0) {
-        if (!effort_template || !merged_system.empty() || !reasoning_instructions.empty()) {
-            rendered += "<|im_start|>system\n";
-            if (!reasoning_instructions.empty()) {
-                rendered += reasoning_instructions;
-                if (!merged_system.empty()) { rendered += "\n\n"; }
-            }
-            rendered += merged_system;
-            rendered += "<|im_end|>\n";
-        }
-    } else if (!reasoning_instructions.empty()) {
+        rendered += render_tools_system_block(options.tool_jsons, merged_system);
+    } else if (num_sys != 0 && (!effort_template || !merged_system.empty())) {
         rendered += "<|im_start|>system\n";
-        rendered += reasoning_instructions;
+        rendered += merged_system;
         rendered += "<|im_end|>\n";
     }
 
@@ -394,7 +353,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (!turn_rewrite_byte_offset && static_cast<long>(i) > last_query_index) {
             turn_rewrite_byte_offset = rendered.size();
         }
-        if (keep_thinking) {
+        if (keep_thinking && !reasoning.empty()) {
             rendered += "<think>\n";
             rendered += reasoning;
             rendered += "\n</think>\n\n";

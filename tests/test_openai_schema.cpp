@@ -60,7 +60,6 @@ ninfer::PromptCapabilities effort_capabilities() {
     capabilities.reasoning_effort.low            = true;
     capabilities.reasoning_effort.medium         = true;
     capabilities.reasoning_effort.xhigh          = true;
-    capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
     return capabilities;
 }
 

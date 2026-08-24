@@ -264,7 +264,6 @@ struct ReasoningEffortCapabilities {
     bool low    = false;
     bool medium = false;
     bool xhigh  = false;
-    std::optional<ReasoningEffort> default_effort;
 
     [[nodiscard]] constexpr bool supports(ReasoningEffort effort) const noexcept {
         switch (effort) {
