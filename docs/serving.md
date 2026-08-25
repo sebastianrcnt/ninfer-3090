@@ -113,6 +113,13 @@ Streaming begins with an assistant-role chunk, sends separate reasoning and cont
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage.
 
+Nothing is written between the opening chunk and the first generated token, and on a cold prefix
+that gap is the whole queue-and-prefill time, which can exceed a client's idle-body timeout. While
+a stream is waiting for its first token, NInfer emits an SSE comment line (`: keepalive`) every 15
+seconds; `/v1/messages` emits its `ping` event instead. Both are ignored by conforming readers and
+stop at the first token. A client that closes the connection during that wait is detected then
+rather than after the prefill completes.
+
 `usage` carries `prompt_tokens_details.cached_tokens` and
 `completion_tokens_details.reasoning_tokens` on both the non-streaming response and that final
 streaming chunk. Both are always present, and zero when nothing was reused or no reasoning was

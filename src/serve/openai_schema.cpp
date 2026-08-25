@@ -701,6 +701,8 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
     return sse_event(payload);
 }
 
+std::string sse_keepalive() { return ": keepalive\n\n"; }
+
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
 std::string make_models_list(const std::string& model_id, std::int64_t created) {
