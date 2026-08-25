@@ -169,6 +169,11 @@ ninfer_add_test(ninfer_response_store_test
 ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES test_anthropic_schema.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_stream_writer_test
+  SOURCES test_stream_writer.cpp
+  LIBRARIES ninfer_serve)
+target_include_directories(ninfer_stream_writer_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES test_tool_call_parser.cpp
   LIBRARIES ninfer_serve)

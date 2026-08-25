@@ -4,6 +4,7 @@
 #include "serve/console_log.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
+#include "serve/stream_writer.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -40,72 +41,6 @@ struct StreamingRequest {
     PreparedRequest prepared;
     std::atomic<bool> cancelled{false};
     bool started = false;
-    // The keep-alive timer writes from its own thread while the request thread is inside
-    // the engine, so every sink write is serialized here.
-    std::mutex write_mutex;
-};
-
-// Between the opening event and the first generated token a stream writes nothing, and a
-// cold prefill can hold that gap open for many minutes. Clients close an idle body long
-// before that -- undici, which most Node clients use, defaults to 300 s -- so the request
-// dies before it can produce the tokens that would have kept it alive. Emitting an ignorable
-// event on an interval resets that timer, and detecting a disconnect here also ends a
-// prefill nobody is waiting for any more.
-constexpr auto kStreamKeepAliveInterval = std::chrono::seconds(15);
-
-class ClientDisconnected final : public std::exception {
-public:
-    [[nodiscard]] const char* what() const noexcept override { return "client disconnected"; }
-};
-
-void write_stream_item(httplib::DataSink& sink, StreamingRequest& request,
-                       const std::string& item) {
-    const std::lock_guard<std::mutex> lock(request.write_mutex);
-    if (request.cancelled.load(std::memory_order_acquire) ||
-        (sink.is_writable && !sink.is_writable()) || !sink.write(item.data(), item.size())) {
-        request.cancelled.store(true, std::memory_order_release);
-        throw ClientDisconnected();
-    }
-}
-
-// Writes `payload` every kStreamKeepAliveInterval until stopped. Stopping is idempotent
-// and happens at the first token, when generation returns, or when the scope unwinds.
-class StreamKeepAlive {
-public:
-    StreamKeepAlive(httplib::DataSink& sink, StreamingRequest& request, std::string payload)
-        : worker_([this, &sink, &request, payload = std::move(payload)] {
-              std::unique_lock<std::mutex> lock(mutex_);
-              while (!cv_.wait_for(lock, kStreamKeepAliveInterval,
-                                   [this] { return stopped_; })) {
-                  try {
-                      write_stream_item(sink, request, payload);
-                  } catch (const std::exception&) {
-                      stopped_ = true;
-                  }
-              }
-          }) {}
-
-    StreamKeepAlive(const StreamKeepAlive&)            = delete;
-    StreamKeepAlive& operator=(const StreamKeepAlive&) = delete;
-
-    ~StreamKeepAlive() { stop(); }
-
-    void stop() {
-        if (finished_.exchange(true, std::memory_order_acq_rel)) { return; }
-        {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            stopped_ = true;
-        }
-        cv_.notify_all();
-        if (worker_.joinable()) { worker_.join(); }
-    }
-
-private:
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    bool stopped_ = false;
-    std::atomic<bool> finished_{false};
-    std::thread worker_;
 };
 
 void set_owned_content(httplib::Response& response, std::string body,
@@ -509,21 +444,16 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 return true;
             }
             stream->started = true;
+            StreamWriter writer(sink, stream->cancelled);
             try {
-                write_stream_item(sink, *stream,
-                                  make_chat_chunk_role(id, model, created, include_usage));
-                StreamKeepAlive keepalive(sink, *stream, sse_keepalive());
+                writer.write(make_chat_chunk_role(id, model, created, include_usage));
+                StreamKeepAlive keepalive(writer, sse_keepalive());
                 StreamSink output;
                 output.on_content = [&](const std::string& text) {
-                    keepalive.stop();
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_content(id, model, created, text, include_usage));
+                    writer.write(make_chat_chunk_content(id, model, created, text, include_usage));
                 };
                 output.on_reasoning = [&](const std::string& text) {
-                    keepalive.stop();
-                    write_stream_item(
-                        sink, *stream,
+                    writer.write(
                         make_chat_chunk_reasoning(id, model, created, text, include_usage));
                 };
                 output.is_cancelled = [&] {
@@ -537,36 +467,29 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {
-                        write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created,
-                                                                  std::string(remaining),
-                                                                  include_usage));
+                        writer.write(make_chat_chunk_content(id, model, created,
+                                                             std::string(remaining),
+                                                             include_usage));
                     }
-                    write_stream_item(sink, *stream,
-                                      make_chat_chunk_tool_calls(
-                                          id, model, created, outcome.tool_calls, include_usage));
-                    write_stream_item(
-                        sink, *stream,
+                    writer.write(make_chat_chunk_tool_calls(id, model, created,
+                                                            outcome.tool_calls, include_usage));
+                    writer.write(
                         make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
                 } else {
                     if (tool_capable && !remaining.empty()) {
-                        write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created,
-                                                                  std::string(remaining),
-                                                                  include_usage));
+                        writer.write(make_chat_chunk_content(id, model, created,
+                                                             std::string(remaining),
+                                                             include_usage));
                     }
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_final(id, model, created,
-                                              finish_reason_wire(outcome.finish_reason),
-                                              include_usage));
+                    writer.write(make_chat_chunk_final(id, model, created,
+                                                       finish_reason_wire(outcome.finish_reason),
+                                                       include_usage));
                 }
                 if (include_usage) {
                     const CompletionUsage usage = completion_usage(outcome);
-                    write_stream_item(sink, *stream,
-                                      make_chat_chunk_usage(id, model, created, usage));
+                    writer.write(make_chat_chunk_usage(id, model, created, usage));
                 }
-                write_stream_item(sink, *stream, sse_done());
+                writer.write(sse_done());
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& e) {
@@ -575,7 +498,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             } catch (const ApiException& e) {
                 log_request_error(log_context, e.error().message);
                 try {
-                    write_stream_item(sink, *stream, sse_error_event(e.error()));
+                    writer.write(sse_error_event(e.error()));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -586,7 +509,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 error.type    = "internal_error";
                 error.message = e.what();
                 try {
-                    write_stream_item(sink, *stream, sse_error_event(error));
+                    writer.write(sse_error_event(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -717,35 +640,31 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             int thinking_index = -1;
             bool text_open     = false;
             int text_index     = -1;
+            StreamWriter writer(sink, stream->cancelled);
             try {
-                write_stream_item(sink, *stream, make_message_start(id, model, input_tokens));
-                StreamKeepAlive keepalive(sink, *stream, make_messages_ping());
+                writer.write(make_message_start(id, model, input_tokens));
+                StreamKeepAlive keepalive(writer, make_messages_ping());
 
                 StreamSink output;
                 output.on_reasoning = [&](const std::string& text) {
-                    keepalive.stop();
                     if (!thinking_open) {
                         thinking_index = next_index++;
                         thinking_open  = true;
-                        write_stream_item(sink, *stream,
-                                          make_content_block_start_thinking(thinking_index));
+                        writer.write(make_content_block_start_thinking(thinking_index));
                     }
-                    write_stream_item(sink, *stream,
-                                      make_content_block_delta_thinking(thinking_index, text));
+                    writer.write(make_content_block_delta_thinking(thinking_index, text));
                 };
                 output.on_content = [&](const std::string& text) {
-                    keepalive.stop();
                     if (thinking_open) {
-                        write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
+                        writer.write(make_content_block_stop(thinking_index));
                         thinking_open = false;
                     }
                     if (!text_open) {
                         text_index = next_index++;
                         text_open  = true;
-                        write_stream_item(sink, *stream, make_content_block_start_text(text_index));
+                        writer.write(make_content_block_start_text(text_index));
                     }
-                    write_stream_item(sink, *stream,
-                                      make_content_block_delta_text(text_index, text));
+                    writer.write(make_content_block_delta_text(text_index, text));
                 };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
@@ -758,45 +677,39 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 const std::string_view remaining = unstreamed_content(outcome);
 
                 if (thinking_open) {
-                    write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
+                    writer.write(make_content_block_stop(thinking_index));
                     thinking_open = false;
                 }
                 if (text_open) {
-                    write_stream_item(sink, *stream, make_content_block_stop(text_index));
+                    writer.write(make_content_block_stop(text_index));
                     text_open = false;
                 }
 
                 if (tool_capable) {
                     if (!remaining.empty()) {
                         const int idx = next_index++;
-                        write_stream_item(sink, *stream, make_content_block_start_text(idx));
-                        write_stream_item(
-                            sink, *stream,
-                            make_content_block_delta_text(idx, std::string(remaining)));
-                        write_stream_item(sink, *stream, make_content_block_stop(idx));
+                        writer.write(make_content_block_start_text(idx));
+                        writer.write(make_content_block_delta_text(idx, std::string(remaining)));
+                        writer.write(make_content_block_stop(idx));
                     }
                     for (const ToolCall& call : outcome.tool_calls) {
                         const int idx = next_index++;
-                        write_stream_item(sink, *stream,
-                                          make_content_block_start_tool_use(idx, call));
-                        write_stream_item(
-                            sink, *stream,
-                            make_content_block_delta_tool_json(idx, call.arguments_json));
-                        write_stream_item(sink, *stream, make_content_block_stop(idx));
+                        writer.write(make_content_block_start_tool_use(idx, call));
+                        writer.write(make_content_block_delta_tool_json(idx, call.arguments_json));
+                        writer.write(make_content_block_stop(idx));
                     }
                 }
 
                 if (next_index == 0) {
                     const int idx = next_index++;
-                    write_stream_item(sink, *stream, make_content_block_start_text(idx));
-                    write_stream_item(sink, *stream, make_content_block_stop(idx));
+                    writer.write(make_content_block_start_text(idx));
+                    writer.write(make_content_block_stop(idx));
                 }
 
                 const char* stop_reason =
                     messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
-                write_stream_item(sink, *stream,
-                                  make_message_delta(stop_reason, outcome.completion_tokens));
-                write_stream_item(sink, *stream, make_message_stop());
+                writer.write(make_message_delta(stop_reason, outcome.completion_tokens));
+                writer.write(make_message_stop());
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& e) {
@@ -805,7 +718,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             } catch (const ApiException& e) {
                 log_request_error(log_context, e.error().message);
                 try {
-                    write_stream_item(sink, *stream, messages_sse_error_event(e.error()));
+                    writer.write(messages_sse_error_event(e.error()));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -816,7 +729,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 error.type    = "internal_error";
                 error.message = e.what();
                 try {
-                    write_stream_item(sink, *stream, messages_sse_error_event(error));
+                    writer.write(messages_sse_error_event(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
