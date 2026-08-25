@@ -2,6 +2,7 @@
 
 #include "serve/openai_schema.h"
 #include "serve/responses_schema.h"
+#include "serve/stream_writer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -23,11 +24,6 @@ namespace ninfer::serve {
 namespace {
 
 using Json = nlohmann::json;
-
-class ClientDisconnected final : public std::exception {
-public:
-    [[nodiscard]] const char* what() const noexcept override { return "client disconnected"; }
-};
 
 struct StreamingResponse {
     PreparedRequest prepared;
@@ -92,20 +88,6 @@ Json parse_json_body(const httplib::Request& request) {
 
 bool disconnected(const httplib::Request& request) {
     return request.is_connection_alive && !request.is_connection_alive();
-}
-
-void write_stream_item(httplib::DataSink& sink, StreamingResponse& request,
-                       const std::string& item) {
-    if (request.cancelled.load(std::memory_order_acquire) ||
-        (sink.is_writable && !sink.is_writable()) || !sink.write(item.data(), item.size())) {
-        request.cancelled.store(true, std::memory_order_release);
-        throw ClientDisconnected();
-    }
-}
-
-void write_stream_items(httplib::DataSink& sink, StreamingResponse& request,
-                        std::vector<std::string> items) {
-    for (const std::string& item : items) { write_stream_item(sink, request, item); }
 }
 
 void set_owned_content(httplib::Response& response, std::string body,
@@ -286,14 +268,16 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 return true;
             }
             stream->started = true;
+            StreamWriter writer(sink, stream->cancelled);
             try {
-                write_stream_items(sink, *stream, stream->encoder->start());
+                writer.write_all(stream->encoder->start());
+                StreamKeepAlive keepalive(writer, sse_keepalive());
                 StreamSink output;
                 output.on_reasoning = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->reasoning_delta(text));
+                    writer.write_all(stream->encoder->reasoning_delta(text));
                 };
                 output.on_content = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->content_delta(text));
+                    writer.write_all(stream->encoder->content_delta(text));
                 };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
@@ -301,6 +285,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 };
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                keepalive.stop();
                 ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
                 if (stream->request.store) {
                     StoredResponse stored;
@@ -312,9 +297,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     stored.preserve_thinking = stream->prepared.preserve_thinking;
                     response_store_.put(std::move(stored));
                 }
-                write_stream_items(sink, *stream, std::move(finished.events_before_terminal));
+                writer.write_all(finished.events_before_terminal);
                 log_request_done(stream->log_context, outcome);
-                write_stream_item(sink, *stream, stream->encoder->terminal(finished.response));
+                writer.write(stream->encoder->terminal(finished.response));
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& exception) {
@@ -324,7 +309,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 const ApiError error = responses_error(exception.error());
                 log_request_error(stream->log_context, error.message);
                 try {
-                    write_stream_item(sink, *stream, stream->encoder->failed(error));
+                    writer.write(stream->encoder->failed(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -332,7 +317,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 const ApiError error = internal_error(exception);
                 log_request_error(stream->log_context, error.message);
                 try {
-                    write_stream_item(sink, *stream, stream->encoder->failed(error));
+                    writer.write(stream->encoder->failed(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }

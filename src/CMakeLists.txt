@@ -343,6 +343,7 @@ if(NINFER_BUILD_SERVE)
     serve/console_log.cpp
     serve/generation_service.cpp
     serve/request_log.cpp
+    serve/stream_writer.cpp
     serve/http_server.cpp
     serve/responses_http.cpp
     serve/serve_options.cpp)
