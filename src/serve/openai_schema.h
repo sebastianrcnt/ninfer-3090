@@ -76,6 +76,10 @@ std::string make_chat_chunk_final(const std::string& id, const std::string& mode
 // only when stream_options.include_usage is true.
 std::string make_chat_chunk_usage(const std::string& id, const std::string& model,
                                   std::int64_t created, const CompletionUsage& usage);
+// SSE comment line. Conforming readers ignore it; it exists only to reset a client's
+// idle-body timer while nothing else is being written.
+std::string sse_keepalive();
+
 std::string sse_done();
 
 // /v1/models payloads.

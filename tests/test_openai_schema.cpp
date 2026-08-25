@@ -720,6 +720,14 @@ int test_chunk_serialization() {
                       "usage chunk reported cache_write_tokens");
 
     failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
+
+    // A keep-alive must stay invisible: an SSE comment line, carrying no data field, so a
+    // conforming reader dispatches nothing for it.
+    const std::string keepalive = sse_keepalive();
+    failures += check(keepalive.starts_with(":") && keepalive.ends_with("\n\n") &&
+                          keepalive.find("data:") == std::string::npos &&
+                          keepalive.find("event:") == std::string::npos,
+                      "keep-alive was not an inert SSE comment");
     return failures;
 }
 

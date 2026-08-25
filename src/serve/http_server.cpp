@@ -11,12 +11,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 namespace ninfer::serve {
@@ -38,7 +40,18 @@ struct StreamingRequest {
     PreparedRequest prepared;
     std::atomic<bool> cancelled{false};
     bool started = false;
+    // The keep-alive timer writes from its own thread while the request thread is inside
+    // the engine, so every sink write is serialized here.
+    std::mutex write_mutex;
 };
+
+// Between the opening event and the first generated token a stream writes nothing, and a
+// cold prefill can hold that gap open for many minutes. Clients close an idle body long
+// before that -- undici, which most Node clients use, defaults to 300 s -- so the request
+// dies before it can produce the tokens that would have kept it alive. Emitting an ignorable
+// event on an interval resets that timer, and detecting a disconnect here also ends a
+// prefill nobody is waiting for any more.
+constexpr auto kStreamKeepAliveInterval = std::chrono::seconds(15);
 
 class ClientDisconnected final : public std::exception {
 public:
@@ -47,12 +60,53 @@ public:
 
 void write_stream_item(httplib::DataSink& sink, StreamingRequest& request,
                        const std::string& item) {
+    const std::lock_guard<std::mutex> lock(request.write_mutex);
     if (request.cancelled.load(std::memory_order_acquire) ||
         (sink.is_writable && !sink.is_writable()) || !sink.write(item.data(), item.size())) {
         request.cancelled.store(true, std::memory_order_release);
         throw ClientDisconnected();
     }
 }
+
+// Writes `payload` every kStreamKeepAliveInterval until stopped. Stopping is idempotent
+// and happens at the first token, when generation returns, or when the scope unwinds.
+class StreamKeepAlive {
+public:
+    StreamKeepAlive(httplib::DataSink& sink, StreamingRequest& request, std::string payload)
+        : worker_([this, &sink, &request, payload = std::move(payload)] {
+              std::unique_lock<std::mutex> lock(mutex_);
+              while (!cv_.wait_for(lock, kStreamKeepAliveInterval,
+                                   [this] { return stopped_; })) {
+                  try {
+                      write_stream_item(sink, request, payload);
+                  } catch (const std::exception&) {
+                      stopped_ = true;
+                  }
+              }
+          }) {}
+
+    StreamKeepAlive(const StreamKeepAlive&)            = delete;
+    StreamKeepAlive& operator=(const StreamKeepAlive&) = delete;
+
+    ~StreamKeepAlive() { stop(); }
+
+    void stop() {
+        if (finished_.exchange(true, std::memory_order_acq_rel)) { return; }
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            stopped_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) { worker_.join(); }
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stopped_ = false;
+    std::atomic<bool> finished_{false};
+    std::thread worker_;
+};
 
 void set_owned_content(httplib::Response& response, std::string body,
                        std::shared_ptr<RequestLifetime> lifetime) {
@@ -458,13 +512,16 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             try {
                 write_stream_item(sink, *stream,
                                   make_chat_chunk_role(id, model, created, include_usage));
+                StreamKeepAlive keepalive(sink, *stream, sse_keepalive());
                 StreamSink output;
                 output.on_content = [&](const std::string& text) {
+                    keepalive.stop();
                     write_stream_item(
                         sink, *stream,
                         make_chat_chunk_content(id, model, created, text, include_usage));
                 };
                 output.on_reasoning = [&](const std::string& text) {
+                    keepalive.stop();
                     write_stream_item(
                         sink, *stream,
                         make_chat_chunk_reasoning(id, model, created, text, include_usage));
@@ -475,6 +532,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 };
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                keepalive.stop();
                 log_request_done(log_context, outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
@@ -661,9 +719,11 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             int text_index     = -1;
             try {
                 write_stream_item(sink, *stream, make_message_start(id, model, input_tokens));
+                StreamKeepAlive keepalive(sink, *stream, make_messages_ping());
 
                 StreamSink output;
                 output.on_reasoning = [&](const std::string& text) {
+                    keepalive.stop();
                     if (!thinking_open) {
                         thinking_index = next_index++;
                         thinking_open  = true;
@@ -674,6 +734,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                       make_content_block_delta_thinking(thinking_index, text));
                 };
                 output.on_content = [&](const std::string& text) {
+                    keepalive.stop();
                     if (thinking_open) {
                         write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
                         thinking_open = false;
@@ -692,6 +753,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 };
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                keepalive.stop();
                 log_request_done(log_context, outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
 
